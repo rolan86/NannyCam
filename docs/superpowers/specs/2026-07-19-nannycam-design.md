@@ -47,7 +47,7 @@ Four units:
   - Noise: Web Audio `AnalyserNode` RMS level with threshold + hysteresis.
   - Motion: throttled canvas frame-diffing (low frame rate to bound CPU/heat).
 - Plays incoming talk-back audio from viewer.
-- Data channel per viewer: heartbeat (2s interval) + alert events (JSON).
+- Data channel per viewer: heartbeat sent camera → viewer every 2s, plus alert events (JSON).
 
 ### 2. Viewer page (`/viewer`)
 
@@ -60,9 +60,11 @@ Four units:
 
 - Serves Vite-built static assets.
 - WebSocket relay for SDP offers/answers and ICE candidates. Sees metadata only, never media.
-- Room model: camera creates room → server issues short code (shown as text + QR). One camera per room, N viewers. Room dies when camera leaves; codes expire with the room.
+- Room model: camera creates room → server issues short code (shown as text + QR) plus a private **camera token** (random secret, held in the camera page's localStorage). One camera per room; viewers hard-capped at 3 by the server.
+- **Room lifecycle:** a camera disconnect does NOT kill the room — it enters an *orphaned* grace state (10 minutes) during which viewers stay joined (and alarm). The camera re-claims its room by presenting code + camera token. Only an explicit "Stop camera" action — or grace-period expiry — destroys the room and its code.
+- **Server-restart recovery:** state is in-memory, so after a restart no rooms exist. A camera page reconnecting may then *re-create* a room with its previously issued code (client-supplied on recreation only). The code's entropy (≥ 8 random chars, known only to the paired devices) is the authentication for this path; a fresh camera token is issued on re-creation.
 - Join attempts rate-limited; all WS messages schema-validated (hostile tailnet guest must not crash or hijack the relay).
-- State is in-memory only; server restart is a tolerated failure (see reconnection ladder).
+- State is in-memory only; server restart is a tolerated failure (see Room lifecycle above and the reconnection ladder).
 
 ### 4. Network/TLS layer (no app code)
 
