@@ -1,0 +1,8 @@
+# Task 12 review fold-in: a bare `bun test` (no args) must not attempt to run
+# the Playwright specs in e2e/** — those use `test`/`expect` from
+# '@playwright/test', which bun:test's own globals collide with (Playwright
+# throws "did not expect test() to be called here"). package.json's "test"
+# script already passes --path-ignore-patterns explicitly; this file makes a
+# bare `bun test` invocation green too, matching that same ignore pattern.
+[test]
+pathIgnorePatterns = ["e2e/**"]

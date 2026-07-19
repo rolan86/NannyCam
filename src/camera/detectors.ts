@@ -176,6 +176,13 @@ export const DEFAULT_MOTION_THRESHOLD = sensitivityToThreshold(
 export interface AudioContextLike {
   createMediaStreamSource(stream: MediaStream): MediaStreamAudioSourceNode;
   createAnalyser(): AnalyserNode;
+  /**
+   * Optional (real AudioContext has it; test doubles may omit it) — Task 12
+   * review fold-in: declaring it here lets syncNoiseSource below call it
+   * directly instead of double-casting through `unknown` to a locally
+   * redeclared shape.
+   */
+  close?(): Promise<void>;
 }
 
 /**
@@ -478,9 +485,8 @@ export class DetectorController {
       // .close() returns a Promise that can REJECT (e.g. an already-closed
       // context) — a synchronous try/catch never sees that; .catch() is the
       // established pattern in this codebase for exactly this shape.
-      const ctx = this.noiseAudioCtx as unknown as { close?: () => Promise<void> } | null;
       try {
-        void ctx?.close?.()?.catch(() => {});
+        void this.noiseAudioCtx?.close?.()?.catch(() => {});
       } catch {
         // Non-fatal: the context is being discarded either way.
       }

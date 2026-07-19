@@ -410,6 +410,16 @@ export class ViewerSession {
    *     per connection" rule (see adoptPeer's doc) applies to this press
    *     too — the track is stored + attached (disabled) to the NEW
    *     transceiver, but talk goes back to 'idle' rather than 'talking'.
+   *
+   * Invariant: after EVERY await below, re-check in this order —
+   * teardownEpoch, then adoptionEpoch, then state.talk — because a teardown
+   * (leave()/'ended'/fail()) also invalidates whatever peer adoption may
+   * have happened after it, so ruling that out first short-circuits
+   * correctly; checking adoptionEpoch first could attach a track to a
+   * transceiver whose Peer is itself already being torn down. state.talk is
+   * checked last since a plain release (stopTalk(), no teardown/adoption
+   * involved) is the most common reason to bail and needs no cleanup beyond
+   * not overwriting the state the release already set.
    */
   async startTalk(): Promise<void> {
     const talk = this.state.talk;

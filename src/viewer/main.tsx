@@ -213,6 +213,19 @@ function App() {
 
   useEffect(() => session.onState(setState), []);
   useEffect(() => monitor.onState(setMonitorState), []);
+  // Task 12 review fold-in: the PTT button only renders while phase ===
+  // 'live' (see the switch below), so a peer death or teardown that yanks
+  // the phase out from under a held press unmounts the button WITHOUT ever
+  // firing pointerup/pointercancel/pointerleave — session.stopTalk() never
+  // gets called, leaving talk stuck at 'talking' cosmetically (the mic track
+  // itself is fine; session.leave()/handleReconnected already release/
+  // disable it independently). This effect's cleanup covers exactly that
+  // gap: it fires whenever phase leaves 'live' (button unmounts) or the
+  // whole page unmounts, same as a release would.
+  useEffect(() => {
+    if (state.phase !== 'live') return undefined;
+    return () => session.stopTalk();
+  }, [state.phase]);
   useEffect(
     () =>
       session.onRemoteStream((stream) => {
