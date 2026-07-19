@@ -120,6 +120,7 @@ DOWN state is unmissable: full-screen red + repeating alarm tone. A monitor that
 
 Enforcement:
 - Room codes: ≥ 8 chars of real entropy (crypto.getRandomValues), single camera per room, expire with the room.
+- Known limitation, accepted: after a server restart, possession of the room code alone grants the camera role on re-creation — any code-holder (including a viewer device) could claim it. This is within the trusted-pair assumption; devices outside the pair never learn the code.
 - Rate-limited joins; schema-validated WS messages.
 - No accounts, cookies, analytics, or external requests of any kind. **CSP header mechanically enforces the no-external-requests claim** so users can verify it in DevTools.
 
