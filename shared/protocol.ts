@@ -58,7 +58,12 @@ const anyJson: FieldCheck = () => true;
 // Per-direction spec: message type -> required fields and their checks.
 // Extra fields beyond the spec are rejected (strict relay: an otherwise-valid
 // message carrying unknown fields is treated as invalid).
-const SPECS: Record<Direction, Record<string, Record<string, FieldCheck>>> = {
+// Keyed against the unions so a missing, extra, or misspelled type key is a
+// compile error — the table cannot drift from C2S/S2C.
+const SPECS: {
+  c2s: Record<C2S['type'], Record<string, FieldCheck>>;
+  s2c: Record<S2C['type'], Record<string, FieldCheck>>;
+} = {
   c2s: {
     'create-room': {},
     'recreate-room': { code: isString },
@@ -82,6 +87,8 @@ const SPECS: Record<Direction, Record<string, Record<string, FieldCheck>>> = {
 const hasOwn = (obj: object, key: string): boolean =>
   Object.prototype.hasOwnProperty.call(obj, key);
 
+const utf8 = new TextEncoder();
+
 /**
  * Validate a raw wire string against the protocol for the given direction.
  * Returns the typed message, or `null` for anything invalid. Never throws —
@@ -94,7 +101,7 @@ export function parseMessage(raw: string, direction: Direction): C2S | S2C | nul
   if (typeof raw !== 'string' || raw.length === 0) return null;
   // Fast path: UTF-8 byte length is always >= UTF-16 code-unit length.
   if (raw.length > MAX_MESSAGE_BYTES) return null;
-  if (new TextEncoder().encode(raw).byteLength > MAX_MESSAGE_BYTES) return null;
+  if (utf8.encode(raw).byteLength > MAX_MESSAGE_BYTES) return null;
 
   let data: unknown;
   try {
@@ -109,7 +116,9 @@ export function parseMessage(raw: string, direction: Direction): C2S | S2C | nul
   const type = obj.type;
   if (typeof type !== 'string') return null;
 
-  const directionSpecs = SPECS[direction];
+  // Widened view for string-keyed lookup; the SPECS declaration above keeps
+  // the table itself compile-time linked to the unions.
+  const directionSpecs: Record<string, Record<string, FieldCheck>> = SPECS[direction];
   // hasOwn guard: a hostile `type` like "__proto__" or "constructor" must not
   // resolve through the spec object's prototype chain.
   if (!hasOwn(directionSpecs, type)) return null;

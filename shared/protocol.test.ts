@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
   CODE_ALPHABET,
+  MAX_MESSAGE_BYTES,
   generateCode,
   generateToken,
   parseMessage,
@@ -299,6 +300,15 @@ describe('parseMessage enforces the 64 KB limit', () => {
     expect(parseMessage(big, 'c2s')).toBeNull();
   });
 
+  test('message of exactly MAX_MESSAGE_BYTES bytes is accepted', () => {
+    const overhead = j({ type: 'signal', to: 'p1', payload: '' }).length;
+    const payload = 'x'.repeat(MAX_MESSAGE_BYTES - overhead);
+    const raw = j({ type: 'signal', to: 'p1', payload });
+    expect(raw.length).toBe(MAX_MESSAGE_BYTES);
+    expect(new TextEncoder().encode(raw).byteLength).toBe(MAX_MESSAGE_BYTES);
+    expect(parseMessage(raw, 'c2s')).toEqual({ type: 'signal', to: 'p1', payload });
+  });
+
   test('large-but-under-limit message is accepted', () => {
     const payload = 'x'.repeat(60 * 1024);
     const raw = j({ type: 'signal', to: 'p1', payload });
@@ -310,6 +320,12 @@ describe('parseMessage enforces the 64 KB limit', () => {
 // -- hostile input ----------------------------------------------------------
 
 describe('parseMessage never throws on hostile input', () => {
+  test('non-string raw input returns null instead of throwing', () => {
+    expect(parseMessage(undefined as never, 'c2s')).toBeNull();
+    expect(parseMessage(null as never, 's2c')).toBeNull();
+    expect(parseMessage(42 as never, 'c2s')).toBeNull();
+  });
+
   test('prototype-pollution-style type', () => {
     expect(parseMessage(j({ type: '__proto__' }), 'c2s')).toBeNull();
     expect(parseMessage(j({ type: 'constructor' }), 'c2s')).toBeNull();
