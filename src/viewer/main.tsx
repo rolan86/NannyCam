@@ -10,6 +10,15 @@ import { ViewerMonitor, type MonitorState } from './monitor.ts';
 import { ViewerSession, type ViewerState } from './session.ts';
 import './viewer.css';
 
+/** A received {t:'alert'} event, as forwarded by ViewerMonitor.onAlert (Task 11). */
+interface AlertEvent {
+  kind: 'noise' | 'motion';
+  at: number;
+}
+
+/** How long the alert banner stays up before auto-dismissing. */
+const ALERT_BANNER_MS = 8000;
+
 const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
 
 const session = new ViewerSession({
@@ -57,6 +66,46 @@ function lastLiveText(lastLiveAt: number | null): string {
   if (lastLiveAt === null) return 'No live signal received yet';
   const seconds = Math.max(0, Math.round((Date.now() - lastLiveAt) / 1000));
   return `Last live: ${new Date(lastLiveAt).toLocaleTimeString()} (${seconds}s ago)`;
+}
+
+function alertText(alert: AlertEvent): string {
+  const label = alert.kind === 'noise' ? 'Noise' : 'Motion';
+  return `${label} detected ${new Date(alert.at).toLocaleTimeString()}`;
+}
+
+/**
+ * Soft two-tone chime for noise/motion alerts — deliberately distinct from
+ * the DOWN alarm's loud repeating square-wave siren (see DownOverlay below):
+ * two short sine tones, quieter gain, plays ONCE per alert rather than
+ * looping. Caller is responsible for the "DOWN outranks alerts" gate (an
+ * alert arriving while the DOWN overlay is up stays silent) and the
+ * audio-unlock gate (session.audioContext is null until unmute()).
+ */
+function playAlertChime(ctx: AudioContext): void {
+  const t0 = ctx.currentTime;
+  const tone = (freq: number, start: number, duration: number) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t0 + start);
+    gain.gain.exponentialRampToValueAtTime(0.15, t0 + start + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + start + duration);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(t0 + start);
+    osc.stop(t0 + start + duration + 0.05);
+  };
+  tone(660, 0, 0.12);
+  tone(880, 0.14, 0.16);
+}
+
+/** Auto-dismissing notice for a noise/motion alert; hidden while DOWN is up (DOWN outranks alerts). */
+function AlertBanner({ alert }: { alert: AlertEvent }) {
+  return (
+    <div class="alert-banner" data-testid="alert-banner">
+      {alertText(alert)}
+    </div>
+  );
 }
 
 /**
@@ -152,8 +201,14 @@ function App() {
   const [code, setCode] = useState(() =>
     window.location.hash.replace(/^#/, '').toUpperCase(),
   );
+  const [alert, setAlert] = useState<AlertEvent | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  // Read inside the onAlert callback below to get the CURRENT down/muted
+  // state at the moment an alert arrives (the subscription itself is
+  // mount-once; a plain closure over state.muted/showDown would go stale).
+  const downRef = useRef(false);
+  const mutedRef = useRef(true);
 
   useEffect(() => session.onState(setState), []);
   useEffect(() => monitor.onState(setMonitorState), []);
@@ -165,6 +220,33 @@ function App() {
       }),
     [],
   );
+  // Alert banner + chime (Task 11). DOWN outranks alerts: an alert arriving
+  // while the DOWN overlay is up is recorded (so it can still show once DOWN
+  // clears, if within its window) but plays no sound. Muted (audio not yet
+  // unlocked by the tap-to-unmute gesture) is visual-only, same as the DOWN
+  // alarm's degraded-but-documented behavior.
+  useEffect(
+    () =>
+      monitor.onAlert((kind, at) => {
+        setAlert({ kind, at });
+        if (downRef.current || mutedRef.current) return;
+        const ctx = session.audioContext as unknown as AudioContext | null;
+        if (ctx === null) return;
+        try {
+          playAlertChime(ctx);
+        } catch {
+          // Non-fatal: the banner is the primary alert signal.
+        }
+      }),
+    [],
+  );
+  // Auto-dismiss: each new alert (even while suppressed by DOWN) gets its
+  // own fresh 8s window.
+  useEffect(() => {
+    if (alert === null) return undefined;
+    const id = setTimeout(() => setAlert(null), ALERT_BANNER_MS);
+    return () => clearTimeout(id);
+  }, [alert]);
   // The <video> mounts/unmounts across screens: re-attach the current stream
   // whenever the phase changes and the element's srcObject is stale.
   useEffect(() => {
@@ -188,6 +270,8 @@ function App() {
   // point (see monitor.ts), so monitorState.down cannot be stale-true there,
   // but the phase check is kept as a second, cheap belt-and-braces guard.
   const showDown = state.phase !== 'ended' && monitorState.active && monitorState.down;
+  downRef.current = showDown;
+  mutedRef.current = state.muted;
 
   let screen: VNode;
   switch (state.phase) {
@@ -275,6 +359,7 @@ function App() {
   return (
     <div class="app-root" data-state={rootDataState(state.phase, monitorState)}>
       {showDown && <DownOverlay monitorState={monitorState} audioUnlocked={!state.muted} />}
+      {!showDown && alert !== null && <AlertBanner alert={alert} />}
       {screen}
     </div>
   );

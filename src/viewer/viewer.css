@@ -42,3 +42,24 @@ button.primary { background: #2b7; color: #fff; }
 .down-overlay h1 { font-size: 3rem; letter-spacing: 0.05em; color: #fff; text-align: center; }
 .down-overlay .down-lastlive { color: #ffd; font-size: 1.1rem; text-align: center; }
 .down-overlay button.silence { background: #fff; color: #b00000; font-weight: bold; }
+
+/* Task 11 — noise/motion alert banner: informational, NOT safety-critical,
+   so it sits below the DOWN overlay (z-index 1000) — DOWN outranks alerts. */
+.alert-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 900;
+  padding: 0.85rem 1rem;
+  text-align: center;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #221a00;
+  background: #ffc233;
+  animation: alert-slide-in 0.2s ease-out;
+}
+@keyframes alert-slide-in {
+  from { transform: translateY(-100%); }
+  to { transform: translateY(0); }
+}

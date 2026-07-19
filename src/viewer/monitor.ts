@@ -85,6 +85,7 @@ export class ViewerMonitor {
   private timer: number | null = null;
   private state: MonitorState = INITIAL_STATE;
   private stateCbs: Array<(s: MonitorState) => void> = [];
+  private alertCbs: Array<(kind: 'noise' | 'motion', at: number) => void> = [];
 
   constructor(opts: ViewerMonitorOptions) {
     this.session = opts.session;
@@ -119,6 +120,19 @@ export class ViewerMonitor {
     };
   }
 
+  /**
+   * Subscribe to noise/motion alert events (Task 11), forwarded from the
+   * camera's {t:'alert',kind,at} data-channel messages — see handleData.
+   * Does NOT fire immediately (unlike onState): an alert is a point-in-time
+   * event, not a state snapshot. Returns an unsubscribe closure.
+   */
+  onAlert(cb: (kind: 'noise' | 'motion', at: number) => void): () => void {
+    this.alertCbs.push(cb);
+    return () => {
+      this.alertCbs = this.alertCbs.filter((f) => f !== cb);
+    };
+  }
+
   // -- wiring -------------------------------------------------------------
 
   private handlePhase(phase: ViewerPhase): void {
@@ -136,22 +150,40 @@ export class ViewerMonitor {
     // the "one code path, no instant-DOWN special-case" the task calls for.
   }
 
+  /**
+   * Parse to a discriminated {t} shape FIRST, then switch — restructured per
+   * the Task 10 review (originally an early `if watchdog===null return`
+   * blocked EVERYTHING, including alerts, before the first live). Only the
+   * 'hb' branch needs a Watchdog to exist; 'alert' is forwarded regardless
+   * of monitoring state (garbage/unrecognized JSON is silently ignored
+   * either way — a malformed data-channel message is not this class's
+   * concern to surface).
+   */
   private handleData(text: string): void {
-    if (this.watchdog === null) return;
     let msg: unknown;
     try {
       msg = JSON.parse(text);
     } catch {
-      return; // non-JSON: not a heartbeat (Task 11 alerts arrive here too)
+      return; // non-JSON
     }
-    if (
-      typeof msg === 'object' &&
-      msg !== null &&
-      (msg as { t?: unknown }).t === 'hb'
-    ) {
-      this.watchdog.onHeartbeat();
+    if (typeof msg !== 'object' || msg === null) return;
+    const t = (msg as { t?: unknown }).t;
+    switch (t) {
+      case 'hb': {
+        if (this.watchdog === null) return;
+        this.watchdog.onHeartbeat();
+        return;
+      }
+      case 'alert': {
+        const kind = (msg as { kind?: unknown }).kind;
+        const at = (msg as { at?: unknown }).at;
+        if ((kind !== 'noise' && kind !== 'motion') || typeof at !== 'number') return;
+        for (const cb of [...this.alertCbs]) cb(kind, at);
+        return;
+      }
+      default:
+        return; // unrecognized shape: ignore
     }
-    // Any other shape (future alert JSON): ignored here — Task 11's concern.
   }
 
   private startMonitoring(): void {

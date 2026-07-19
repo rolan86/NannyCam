@@ -4,12 +4,18 @@
 import { describe, expect, test } from 'bun:test';
 import type { C2S, S2C } from '../../shared/protocol.ts';
 import type { PeerOptions } from '../lib/peer.ts';
+import type { AudioContextLike } from './detectors.ts';
 import {
   CameraSession,
   HEARTBEAT_INTERVAL_MS,
   STORAGE_CODE_KEY,
+  STORAGE_DETECT_MOTION_ENABLED_KEY,
+  STORAGE_DETECT_MOTION_THRESHOLD_KEY,
+  STORAGE_DETECT_NOISE_ENABLED_KEY,
+  STORAGE_DETECT_NOISE_THRESHOLD_KEY,
   STORAGE_TOKEN_KEY,
   type CameraState,
+  type DetectorSettings,
   type PeerLike,
   type SignalingLike,
   type VisibilityLike,
@@ -200,8 +206,48 @@ function fakeStream(tracks: FakeTrack[]): MediaStream {
   return { getTracks: () => tracks } as unknown as MediaStream;
 }
 
+/** Records every noise/motion source the fake factory creates, drivable from tests. */
+function makeFakeNoiseSourceFactory() {
+  const created: Array<{ fire: (rms: number) => void; stopped: boolean }> = [];
+  const factory = (
+    _stream: MediaStream,
+    _ctx: AudioContextLike,
+    onLevel: (rms: number) => void,
+  ) => {
+    const rec = { fire: onLevel, stopped: false };
+    created.push(rec);
+    return {
+      stop() {
+        rec.stopped = true;
+      },
+    };
+  };
+  return { factory, created };
+}
+
+function makeFakeMotionSourceFactory() {
+  const created: Array<{ fire: (fraction: number) => void; stopped: boolean }> = [];
+  const factory = (_videoEl: HTMLVideoElement, onFraction: (fraction: number) => void) => {
+    const rec = { fire: onFraction, stopped: false };
+    created.push(rec);
+    return {
+      stop() {
+        rec.stopped = true;
+      },
+    };
+  };
+  return { factory, created };
+}
+
 function makeHarness(
-  opts: { persisted?: { code: string; token: string }; manualWakeLock?: boolean } = {},
+  opts: {
+    persisted?: { code: string; token: string };
+    manualWakeLock?: boolean;
+    /** Clock seam for detector tests (sustain/cooldown windows); defaults to Date.now. */
+    now?: () => number;
+    /** Initial detector settings (test seam — see loadDetectorSettings's doc). */
+    detectors?: Partial<DetectorSettings>;
+  } = {},
 ) {
   const signaling = new MockSignaling();
   const storage = new FakeStorage();
@@ -226,6 +272,8 @@ function makeHarness(
     },
   };
   const states: CameraState[] = [];
+  const noiseSources = makeFakeNoiseSourceFactory();
+  const motionSources = makeFakeMotionSourceFactory();
   const session = new CameraSession({
     signaling,
     storage,
@@ -240,6 +288,13 @@ function makeHarness(
     clearIntervalFn: intervals.clear,
     wakeLock: wake,
     visibility,
+    now: opts.now,
+    // The real default (`new AudioContext()`) doesn't exist under bun test;
+    // the fake noise-source factory below never touches this value anyway.
+    audioContextFactory: () => ({}) as unknown as AudioContextLike,
+    createNoiseSource: noiseSources.factory,
+    createMotionSource: motionSources.factory,
+    detectors: opts.detectors,
   });
   session.onState((s) => states.push(s));
   const fireVisibility = (state: string) => {
@@ -249,9 +304,11 @@ function makeHarness(
   const last = () => states[states.length - 1]!;
   return {
     session, signaling, storage, location, stream, tracks, peers,
-    intervals, wake, states, last, fireVisibility,
+    intervals, wake, states, last, fireVisibility, noiseSources, motionSources,
   };
 }
+
+const fakeVideoEl = {} as unknown as HTMLVideoElement;
 
 const ROOM_CREATED: S2C = {
   type: 'room-created',
@@ -645,5 +702,167 @@ describe('stop', () => {
 
     await h.session.start();
     expect(h.signaling.sent[h.signaling.sent.length - 1]).toEqual({ type: 'create-room' });
+  });
+});
+
+// -- detectors (Task 11) ------------------------------------------------------
+
+describe('detectors', () => {
+  test('noise/motion detection is OFF by default — nothing created on reaching live', async () => {
+    const h = makeHarness();
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    expect(h.noiseSources.created).toHaveLength(0);
+    expect(h.motionSources.created).toHaveLength(0);
+    expect(h.session.getDetectorSettings()).toMatchObject({
+      noiseEnabled: false,
+      motionEnabled: false,
+    });
+  });
+
+  test('setNoiseEnabled(true) while live creates a noise source; a sustained over-threshold sample broadcasts an alert to ALL peers', async () => {
+    const t = { ms: 0 };
+    const now = () => t.ms;
+    const h = makeHarness({ now, detectors: { noiseThreshold: 0.3 } });
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v1' });
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v2' });
+    h.peers[0]!.openData();
+    h.peers[1]!.openData();
+
+    h.session.setNoiseEnabled(true);
+    expect(h.noiseSources.created).toHaveLength(1);
+    const src = h.noiseSources.created[0]!;
+
+    src.fire(0.5); // t=0: over-threshold run begins
+    t.ms = 499;
+    src.fire(0.5);
+    expect(h.peers[0]!.sentData).toEqual([]); // not sustained yet (500ms)
+    t.ms = 500;
+    src.fire(0.5); // sustained: fires
+    const expected = JSON.stringify({ t: 'alert', kind: 'noise', at: 500 });
+    expect(h.peers[0]!.sentData).toEqual([expected]);
+    expect(h.peers[1]!.sentData).toEqual([expected]); // broadcast to every peer
+  });
+
+  test('setNoiseEnabled(false) stops the running noise source', async () => {
+    const h = makeHarness({ detectors: { noiseEnabled: true } });
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    expect(h.noiseSources.created).toHaveLength(1);
+    expect(h.noiseSources.created[0]!.stopped).toBe(false);
+
+    h.session.setNoiseEnabled(false);
+    expect(h.noiseSources.created[0]!.stopped).toBe(true);
+  });
+
+  test('setNoiseThreshold applies live to the already-running detector', async () => {
+    const t = { ms: 0 };
+    const now = () => t.ms;
+    const h = makeHarness({ now, detectors: { noiseEnabled: true, noiseThreshold: 0.5 } });
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v1' });
+    h.peers[0]!.openData();
+    const src = h.noiseSources.created[0]!;
+
+    src.fire(0.3); // below the 0.5 threshold: never sustains
+    t.ms = 500;
+    src.fire(0.3);
+    expect(h.peers[0]!.sentData).toEqual([]);
+
+    h.session.setNoiseThreshold(0.2); // lower it below the current 0.3 level
+    t.ms = 600;
+    src.fire(0.3); // now over-threshold: sustain run begins
+    t.ms = 1100; // sustained 500ms
+    src.fire(0.3);
+    expect(h.peers[0]!.sentData).toEqual([JSON.stringify({ t: 'alert', kind: 'noise', at: 1100 })]);
+  });
+
+  test('a not-yet-open data channel is a fire-and-forget no-op — never throws', async () => {
+    const t = { ms: 0 };
+    const now = () => t.ms;
+    const h = makeHarness({ now, detectors: { noiseEnabled: true, noiseThreshold: 0.3 } });
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v1' }); // data channel NOT opened
+    const src = h.noiseSources.created[0]!;
+
+    src.fire(0.5);
+    t.ms = 500;
+    expect(() => src.fire(0.5)).not.toThrow();
+    expect(h.peers[0]!.sentData).toEqual([]); // sendData no-ops on a closed channel
+  });
+
+  test('motion: attachMotionSource + setMotionEnabled(true) creates a source; an over-threshold sample fires immediately (sustainMs 0)', async () => {
+    const t = { ms: 0 };
+    const now = () => t.ms;
+    const h = makeHarness({ now, detectors: { motionThreshold: 0.1 } });
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v1' });
+    h.peers[0]!.openData();
+
+    h.session.attachMotionSource(fakeVideoEl);
+    expect(h.motionSources.created).toHaveLength(0); // motionEnabled is still false
+
+    h.session.setMotionEnabled(true);
+    expect(h.motionSources.created).toHaveLength(1);
+    const src = h.motionSources.created[0]!;
+
+    src.fire(0.2); // over the 0.1 threshold: fires immediately, no sustain needed
+    expect(h.peers[0]!.sentData).toEqual([JSON.stringify({ t: 'alert', kind: 'motion', at: 0 })]);
+  });
+
+  test('attachMotionSource(null) stops the running motion source', async () => {
+    const h = makeHarness({ detectors: { motionEnabled: true } });
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    h.session.attachMotionSource(fakeVideoEl);
+    expect(h.motionSources.created).toHaveLength(1);
+    expect(h.motionSources.created[0]!.stopped).toBe(false);
+
+    h.session.attachMotionSource(null);
+    expect(h.motionSources.created[0]!.stopped).toBe(true);
+  });
+
+  test('stop() tears down running noise and motion sources', async () => {
+    const h = makeHarness({ detectors: { noiseEnabled: true, motionEnabled: true } });
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    h.session.attachMotionSource(fakeVideoEl);
+    expect(h.noiseSources.created).toHaveLength(1);
+    expect(h.motionSources.created).toHaveLength(1);
+
+    h.session.stop();
+    expect(h.noiseSources.created[0]!.stopped).toBe(true);
+    expect(h.motionSources.created[0]!.stopped).toBe(true);
+  });
+
+  test('settings persist to storage and are reloaded by a fresh session sharing that storage', () => {
+    const h = makeHarness();
+    h.session.setNoiseThreshold(0.42);
+    h.session.setMotionThreshold(0.07);
+    h.session.setNoiseEnabled(true);
+    h.session.setMotionEnabled(true);
+    expect(h.storage.getItem(STORAGE_DETECT_NOISE_THRESHOLD_KEY)).toBe('0.42');
+    expect(h.storage.getItem(STORAGE_DETECT_MOTION_THRESHOLD_KEY)).toBe('0.07');
+    expect(h.storage.getItem(STORAGE_DETECT_NOISE_ENABLED_KEY)).toBe('true');
+    expect(h.storage.getItem(STORAGE_DETECT_MOTION_ENABLED_KEY)).toBe('true');
+
+    // A fresh session sharing the same storage reloads the PERSISTED values,
+    // not the spec defaults (storage always wins — see loadDetectorSettings).
+    const session2 = new CameraSession({
+      signaling: new MockSignaling(),
+      storage: h.storage,
+      location: { origin: 'https://cam.test', hash: '' },
+    });
+    expect(session2.getDetectorSettings()).toEqual({
+      noiseEnabled: true,
+      motionEnabled: true,
+      noiseThreshold: 0.42,
+      motionThreshold: 0.07,
+    });
   });
 });
