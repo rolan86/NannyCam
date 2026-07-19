@@ -3,8 +3,8 @@
 // Pure logic: no I/O, no timers, no Date.now(). The clock is injected
 // (`now: () => number`, milliseconds) and grace expiry happens only inside
 // sweep(), which the server must call on a short interval. sweep() returns
-// the codes of rooms destroyed by grace expiry so the caller can broadcast
-// room-closed to any remaining viewers.
+// each destroyed room's code plus a snapshot of its viewer ids so the caller
+// can broadcast room-closed without a destroy-then-enumerate ordering trap.
 //
 // Spec (docs/superpowers/specs/2026-07-19-nannycam-design.md):
 // - Camera disconnect does NOT kill the room — it enters an orphaned grace
@@ -18,12 +18,15 @@
 //   a room with that code exists (live or in grace) — no hijacking.
 // - Hard cap of MAX_VIEWERS viewers, server-enforced.
 //
-// Rate limiting: per connection id, sliding 60-second window over FAILED join
-// attempts only (bad-code and room-full both count; successes never count).
-// Once RATE_LIMIT_MAX_FAILURES failures sit inside the window, further joins
-// from that connection get 'rate-limited'. Rate-limited responses themselves
-// are not recorded, so retrying while limited does not extend the window.
-// Limiter state is pruned lazily on each check and globally in sweep().
+// Rate limiting: per connection id, sliding 60-second window over FAILED
+// join and recreate attempts only (bad-code and room-full both count;
+// successes never count). recreateRoom shares the limiter because a failed
+// recreate reveals room existence — unthrottled it would be a room-existence
+// oracle. Once RATE_LIMIT_MAX_FAILURES failures sit inside the window,
+// further attempts from that connection get 'rate-limited'. Rate-limited
+// responses themselves are not recorded, so retrying while limited does not
+// extend the window. Limiter state is pruned lazily on each check and
+// globally in sweep().
 
 import {
   CODE_ALPHABET,
@@ -84,11 +87,16 @@ export class RoomManager {
    * Camera re-creates a room after a server restart, presenting its
    * previously issued code. Refused while any room with that code exists
    * (live or orphaned-in-grace) — a live room cannot be hijacked. Issues a
-   * FRESH camera token; the code's entropy is the authentication.
+   * FRESH camera token; the code's entropy is the authentication. Failed
+   * attempts count toward the same per-connection rate limit as joins —
+   * otherwise this path would be an unthrottled room-existence oracle.
    */
-  recreateRoom(code: string): Result<{ cameraToken: string }> {
+  recreateRoom(code: string, connectionId: string): Result<{ cameraToken: string }> {
+    if (this.isRateLimited(connectionId)) {
+      return { ok: false, reason: 'rate-limited' };
+    }
     if (!isValidCode(code) || this.rooms.has(code)) {
-      return { ok: false, reason: 'bad-code' };
+      return this.recordFailure(connectionId, 'bad-code');
     }
     const cameraToken = generateToken();
     this.rooms.set(code, {
@@ -111,8 +119,8 @@ export class RoomManager {
       return { ok: false, reason: 'rate-limited' };
     }
     const room = this.rooms.get(code);
-    if (!room) return this.failJoin(connectionId, 'bad-code');
-    if (room.viewers.size >= MAX_VIEWERS) return this.failJoin(connectionId, 'room-full');
+    if (!room) return this.recordFailure(connectionId, 'bad-code');
+    if (room.viewers.size >= MAX_VIEWERS) return this.recordFailure(connectionId, 'room-full');
     room.viewers.set(viewerId, connectionId);
     return { ok: true, cameraPresent: room.cameraPresent };
   }
@@ -136,39 +144,46 @@ export class RoomManager {
   /**
    * Camera re-claims its room with code + token. On success the camera is
    * present again, the orphan state is cleared and the grace timer cancelled;
-   * viewers are untouched.
+   * viewers are untouched. Allowed even while the camera is still marked
+   * present (its disconnect may not have been observed yet); the server
+   * replaces the stale camera socket (Task 4).
    */
   reclaimRoom(code: string, cameraToken: string): Result {
     const room = this.rooms.get(code);
     if (!room) return { ok: false, reason: 'bad-code' };
-    if (cameraToken !== room.cameraToken) return { ok: false, reason: 'bad-token' };
+    if (!this.tokenMatches(room, cameraToken)) return { ok: false, reason: 'bad-token' };
     room.cameraPresent = true;
     room.orphanedAt = null;
     return { ok: true };
   }
 
-  /** Explicit "Stop camera": immediate destroy of the room and its code. */
-  stopCamera(code: string, cameraToken: string): Result {
+  /**
+   * Explicit "Stop camera": immediate destroy of the room and its code.
+   * The ok payload carries the evicted viewer ids so the server can
+   * broadcast room-closed to them.
+   */
+  stopCamera(code: string, cameraToken: string): Result<{ viewers: string[] }> {
     const room = this.rooms.get(code);
     if (!room) return { ok: false, reason: 'bad-code' };
-    if (cameraToken !== room.cameraToken) return { ok: false, reason: 'bad-token' };
+    if (!this.tokenMatches(room, cameraToken)) return { ok: false, reason: 'bad-token' };
     this.rooms.delete(code);
-    return { ok: true };
+    return { ok: true, viewers: [...room.viewers.keys()] };
   }
 
   /**
    * Destroy rooms whose grace period expired (now - orphanedAt >= GRACE_MS)
-   * and prune stale rate-limiter state. Returns the codes of destroyed rooms
-   * so the server can broadcast room-closed to their viewers. The server must
-   * call this on a short interval.
+   * and prune stale rate-limiter state. Returns each destroyed room's code
+   * with a snapshot of its viewer ids (taken before destruction) so the
+   * server can broadcast room-closed to them. The server must call this on
+   * a short interval; expiry happens ONLY here, never lazily per call.
    */
-  sweep(): string[] {
+  sweep(): { code: string; viewers: string[] }[] {
     const t = this.now();
-    const destroyed: string[] = [];
+    const destroyed: { code: string; viewers: string[] }[] = [];
     for (const [code, room] of this.rooms) {
       if (room.orphanedAt !== null && t - room.orphanedAt >= GRACE_MS) {
+        destroyed.push({ code, viewers: [...room.viewers.keys()] });
         this.rooms.delete(code);
-        destroyed.push(code);
       }
     }
     for (const [connectionId, times] of this.failedJoins) {
@@ -204,7 +219,15 @@ export class RoomManager {
     return this.failedJoins.size;
   }
 
-  // -- rate limiter internals -----------------------------------------------
+  // -- internals ------------------------------------------------------------
+
+  /**
+   * Single comparison site for camera-token checks (reclaimRoom, stopCamera).
+   * Task 14 (security hardening) can swap this for a constant-time compare.
+   */
+  private tokenMatches(room: Room, cameraToken: string): boolean {
+    return cameraToken === room.cameraToken;
+  }
 
   /** Drop failure timestamps that fell out of the sliding window. */
   private pruneFailures(times: number[], t: number): void {
@@ -224,7 +247,8 @@ export class RoomManager {
     return times.length >= RATE_LIMIT_MAX_FAILURES;
   }
 
-  private failJoin(connectionId: string, reason: ErrorReason): { ok: false; reason: ErrorReason } {
+  /** Record a failed join/recreate attempt against the connection's window. */
+  private recordFailure(connectionId: string, reason: ErrorReason): { ok: false; reason: ErrorReason } {
     let times = this.failedJoins.get(connectionId);
     if (!times) {
       times = [];
