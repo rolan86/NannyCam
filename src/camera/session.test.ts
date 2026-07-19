@@ -17,7 +17,9 @@ import {
   type CameraState,
   type DetectorSettings,
   type PeerLike,
+  type RemoteAudioEntry,
   type SignalingLike,
+  type TrackEventLike,
   type VisibilityLike,
   type WakeLockLike,
 } from './session.ts';
@@ -70,6 +72,7 @@ class MockPeer implements PeerLike {
   private dataOpen = false;
   private openCbs: Array<() => void> = [];
   private stateCbs: Array<(s: RTCPeerConnectionState) => void> = [];
+  private trackCbs: Array<(ev: TrackEventLike) => void> = [];
 
   constructor(opts: PeerOptions) {
     this.remotePeerId = opts.remotePeerId;
@@ -103,6 +106,12 @@ class MockPeer implements PeerLike {
     this.stateCbs.push(cb);
     return () => {};
   }
+  onTrack(cb: (ev: TrackEventLike) => void): () => void {
+    this.trackCbs.push(cb);
+    return () => {
+      this.trackCbs = this.trackCbs.filter((f) => f !== cb);
+    };
+  }
 
   // -- test drivers --
   openData(): void {
@@ -116,6 +125,14 @@ class MockPeer implements PeerLike {
   }
   setConnState(s: RTCPeerConnectionState): void {
     for (const cb of [...this.stateCbs]) cb(s);
+  }
+  /** Task 12: simulate an inbound audio track (a viewer's PTT mic). */
+  emitTrack(kind: 'audio' | 'video', stream: MediaStream): void {
+    for (const cb of [...this.trackCbs]) cb({ track: { kind }, streams: [stream] });
+  }
+  /** Task 12: a track event with no associated stream (defensive edge case). */
+  emitBareTrack(kind: 'audio' | 'video'): void {
+    for (const cb of [...this.trackCbs]) cb({ track: { kind }, streams: [] });
   }
 }
 
@@ -309,6 +326,10 @@ function makeHarness(
 }
 
 const fakeVideoEl = {} as unknown as HTMLVideoElement;
+
+function fakeRemoteStream(id: string): MediaStream {
+  return { id } as unknown as MediaStream;
+}
 
 const ROOM_CREATED: S2C = {
   type: 'room-created',
@@ -864,5 +885,99 @@ describe('detectors', () => {
       noiseThreshold: 0.42,
       motionThreshold: 0.07,
     });
+  });
+});
+
+// -- talk-back (Task 12) ------------------------------------------------------
+
+describe('talk-back: onRemoteAudio', () => {
+  async function live() {
+    const h = makeHarness();
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    return h;
+  }
+
+  test('fires immediately with an empty list, then on every peer-track change', async () => {
+    const h = await live();
+    const seen: RemoteAudioEntry[][] = [];
+    h.session.onRemoteAudio((entries) => seen.push(entries));
+    expect(seen).toEqual([[]]); // fires immediately, current value is empty
+
+    h.signaling.receive({ type: 'peer-joined', peerId: 'viewer-1' });
+    const s1 = fakeRemoteStream('s1');
+    h.peers[0]!.emitTrack('audio', s1);
+    expect(seen[seen.length - 1]).toEqual([{ peerId: 'viewer-1', stream: s1 }]);
+  });
+
+  test('a non-audio track is ignored', async () => {
+    const h = await live();
+    h.signaling.receive({ type: 'peer-joined', peerId: 'viewer-1' });
+    const seen: RemoteAudioEntry[][] = [];
+    h.session.onRemoteAudio((entries) => seen.push(entries));
+    h.peers[0]!.emitTrack('video', fakeRemoteStream('s1'));
+    expect(seen[seen.length - 1]).toEqual([]);
+  });
+
+  test('a track event without streams is ignored (no phantom entry)', async () => {
+    const h = await live();
+    h.signaling.receive({ type: 'peer-joined', peerId: 'viewer-1' });
+    const seen: RemoteAudioEntry[][] = [];
+    h.session.onRemoteAudio((entries) => seen.push(entries));
+    const baseline = seen.length;
+    h.peers[0]!.emitBareTrack('audio');
+    expect(seen.length).toBe(baseline); // setRemoteAudio(id, null) no-ops: nothing was set
+  });
+
+  test('multiple viewers can each contribute an entry', async () => {
+    const h = await live();
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v1' });
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v2' });
+    const seen: RemoteAudioEntry[][] = [];
+    h.session.onRemoteAudio((entries) => seen.push(entries));
+
+    const s1 = fakeRemoteStream('s1');
+    const s2 = fakeRemoteStream('s2');
+    h.peers[0]!.emitTrack('audio', s1);
+    h.peers[1]!.emitTrack('audio', s2);
+    expect(seen[seen.length - 1]).toEqual([
+      { peerId: 'v1', stream: s1 },
+      { peerId: 'v2', stream: s2 },
+    ]);
+  });
+
+  test('peer-left removes that viewer entry (mic LED for THAT stream goes away)', async () => {
+    const h = await live();
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v1' });
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v2' });
+    h.peers[0]!.emitTrack('audio', fakeRemoteStream('s1'));
+    const s2 = fakeRemoteStream('s2');
+    h.peers[1]!.emitTrack('audio', s2);
+
+    const seen: RemoteAudioEntry[][] = [];
+    h.session.onRemoteAudio((entries) => seen.push(entries));
+    h.signaling.receive({ type: 'peer-left', peerId: 'v1' });
+    expect(seen[seen.length - 1]).toEqual([{ peerId: 'v2', stream: s2 }]);
+  });
+
+  test('peer-left for a viewer with no audio entry is a harmless no-op (no spurious callback)', async () => {
+    const h = await live();
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v1' });
+    const seen: RemoteAudioEntry[][] = [];
+    h.session.onRemoteAudio((entries) => seen.push(entries));
+    const baseline = seen.length;
+    h.signaling.receive({ type: 'peer-left', peerId: 'v1' }); // never emitted a track
+    expect(seen.length).toBe(baseline); // setRemoteAudio no-ops; no extra callback
+  });
+
+  test('stop() clears everything; a subsequent onRemoteAudio subscriber sees an empty list', async () => {
+    const h = await live();
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v1' });
+    h.peers[0]!.emitTrack('audio', fakeRemoteStream('s1'));
+
+    h.session.stop();
+    const seen: RemoteAudioEntry[][] = [];
+    h.session.onRemoteAudio((entries) => seen.push(entries));
+    expect(seen).toEqual([[]]);
   });
 });

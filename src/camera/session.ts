@@ -16,27 +16,20 @@
 
 import type { C2S, S2C, ErrorReason } from '../../shared/protocol.ts';
 import { Peer, type PeerOptions } from '../lib/peer.ts';
-import {
-  createMotionSource,
-  createNoiseSource,
-  DEFAULT_MOTION_THRESHOLD,
-  DEFAULT_NOISE_THRESHOLD,
-  MOTION_COOLDOWN_MS,
-  MOTION_HYSTERESIS_RATIO,
-  MOTION_SUSTAIN_MS,
-  NOISE_COOLDOWN_MS,
-  NOISE_HYSTERESIS_RATIO,
-  NOISE_SUSTAIN_MS,
-  ThresholdDetector,
-  type AudioContextLike,
-} from './detectors.ts';
+import { DetectorController, type AudioContextLike, type DetectorSettings } from './detectors.ts';
 
 export const STORAGE_CODE_KEY = 'nannycam.code';
 export const STORAGE_TOKEN_KEY = 'nannycam.token';
-export const STORAGE_DETECT_NOISE_ENABLED_KEY = 'nannycam.detect.noiseEnabled';
-export const STORAGE_DETECT_MOTION_ENABLED_KEY = 'nannycam.detect.motionEnabled';
-export const STORAGE_DETECT_NOISE_THRESHOLD_KEY = 'nannycam.detect.noiseThreshold';
-export const STORAGE_DETECT_MOTION_THRESHOLD_KEY = 'nannycam.detect.motionThreshold';
+// Re-exported for backward compatibility — the detect.* storage keys and the
+// DetectorSettings type now live in detectors.ts (DetectorController owns
+// them); session.ts no longer reads/writes them directly.
+export {
+  STORAGE_DETECT_NOISE_ENABLED_KEY,
+  STORAGE_DETECT_MOTION_ENABLED_KEY,
+  STORAGE_DETECT_NOISE_THRESHOLD_KEY,
+  STORAGE_DETECT_MOTION_THRESHOLD_KEY,
+} from './detectors.ts';
+export type { DetectorSettings } from './detectors.ts';
 export const HEARTBEAT_INTERVAL_MS = 2000;
 
 export type CameraPhase =
@@ -56,12 +49,15 @@ export interface CameraState {
   error?: string;
 }
 
-/** Task 11: noise/motion detector enabled flags + thresholds, persisted to localStorage. */
-export interface DetectorSettings {
-  noiseEnabled: boolean;
-  motionEnabled: boolean;
-  noiseThreshold: number;
-  motionThreshold: number;
+/**
+ * Task 12 (talk-back): one connected viewer's inbound PTT mic stream. Multiple
+ * viewers may hold PTT concurrently — onRemoteAudio hands the UI the full
+ * current list (keyed by peerId) rather than a single stream, so it can mix
+ * by playing every entry's hidden `<audio autoplay>` element at once.
+ */
+export interface RemoteAudioEntry {
+  peerId: string;
+  stream: MediaStream;
 }
 
 /** The slice of SignalingClient the session uses (mockable in tests). */
@@ -70,6 +66,12 @@ export interface SignalingLike {
   send(msg: C2S): void;
   onMessage(cb: (msg: S2C) => void): () => void;
   onReconnected(cb: () => void): () => void;
+}
+
+/** The slice of RTCTrackEvent the session reads; the real event satisfies it. */
+export interface TrackEventLike {
+  readonly track: { readonly kind: string };
+  readonly streams: ReadonlyArray<MediaStream>;
 }
 
 /** The slice of Peer the session uses; the real Peer satisfies it as-is. */
@@ -82,6 +84,8 @@ export interface PeerLike {
   readonly isDataOpen: boolean;
   onDataOpen(cb: () => void): () => void;
   onConnectionState(cb: (s: RTCPeerConnectionState) => void): () => void;
+  /** Task 12 (talk-back): inbound tracks from a viewer's PTT mic. */
+  onTrack(cb: (ev: TrackEventLike) => void): () => void;
 }
 
 /** The slice of localStorage the session uses. */
@@ -128,24 +132,23 @@ export interface CameraSessionOptions {
    * (browser only). The camera side creates its OWN context (no gesture
    * issue — the getUserMedia gesture already happened before 'live'), guarded
    * in a try/catch since construction can still fail (unsupported browser).
+   * Forwarded to DetectorController as-is.
    */
   audioContextFactory?: () => AudioContextLike;
-  /** Noise source factory seam; defaults to the real Web Audio implementation in detectors.ts. */
+  /** Noise source factory seam; forwarded to DetectorController. */
   createNoiseSource?: (
     stream: MediaStream,
     ctx: AudioContextLike,
     onLevel: (rms: number) => void,
   ) => { stop(): void };
-  /** Motion source factory seam; defaults to the real canvas-diff implementation in detectors.ts. */
+  /** Motion source factory seam; forwarded to DetectorController. */
   createMotionSource?: (
     videoEl: HTMLVideoElement,
     onFraction: (fraction: number) => void,
   ) => { stop(): void };
   /**
    * Initial detector settings, used only as the fallback when nothing is yet
-   * persisted in storage (storage always wins once a setting has been
-   * written — see loadDetectorSettings). Mainly a test seam; the real app
-   * relies on the spec defaults (DEFAULT_NOISE_THRESHOLD etc).
+   * persisted in storage. Mainly a test seam; forwarded to DetectorController.
    */
   detectors?: Partial<DetectorSettings>;
 }
@@ -177,16 +180,6 @@ export class CameraSession {
   private readonly wakeLockApi: WakeLockLike | undefined;
   private readonly visibility: VisibilityLike | undefined;
   private readonly now: () => number;
-  private readonly audioContextFactory: () => AudioContextLike;
-  private readonly createNoiseSourceFn: (
-    stream: MediaStream,
-    ctx: AudioContextLike,
-    onLevel: (rms: number) => void,
-  ) => { stop(): void };
-  private readonly createMotionSourceFn: (
-    videoEl: HTMLVideoElement,
-    onFraction: (fraction: number) => void,
-  ) => { stop(): void };
 
   private state: CameraState = { phase: 'idle', viewerCount: 0 };
   private stateCbs: Array<(s: CameraState) => void> = [];
@@ -203,15 +196,11 @@ export class CameraSession {
   /** True while a wakeLock.request() is in flight (single-acquire guard). */
   private wakeAcquiring = false;
 
-  // -- detectors (Task 11) -----------------------------------------------
-  private detectorSettings: DetectorSettings;
-  private readonly noiseDetector: ThresholdDetector;
-  private readonly motionDetector: ThresholdDetector;
-  private noiseSource: { stop(): void } | null = null;
-  private noiseAudioCtx: AudioContextLike | null = null;
-  private motionSource: { stop(): void } | null = null;
-  /** The current preview element, set via attachMotionSource (session stays DOM-free otherwise). */
-  private motionVideoEl: HTMLVideoElement | null = null;
+  // -- detectors (Task 11 logic, owned by DetectorController since Task 12) --
+  private readonly detectors: DetectorController;
+  // -- talk-back (Task 12): map peerId -> that viewer's inbound mic stream. --
+  private readonly remoteAudio = new Map<string, MediaStream>();
+  private remoteAudioCbs: Array<(entries: RemoteAudioEntry[]) => void> = [];
 
   constructor(opts: CameraSessionOptions) {
     this.signaling = opts.signaling;
@@ -236,24 +225,15 @@ export class CameraSession {
     this.visibility =
       opts.visibility ?? (typeof document !== 'undefined' ? document : undefined);
     this.now = opts.now ?? Date.now;
-    this.audioContextFactory = opts.audioContextFactory ?? (() => new AudioContext());
-    this.createNoiseSourceFn = opts.createNoiseSource ?? createNoiseSource;
-    this.createMotionSourceFn = opts.createMotionSource ?? createMotionSource;
-
-    this.detectorSettings = this.loadDetectorSettings(opts.detectors);
-    this.noiseDetector = new ThresholdDetector({
+    this.detectors = new DetectorController({
+      storage: this.storage,
+      getStream: () => this.stream,
+      onAlert: (kind) => this.broadcastAlert(kind),
       now: this.now,
-      threshold: this.detectorSettings.noiseThreshold,
-      sustainMs: NOISE_SUSTAIN_MS,
-      hysteresisRatio: NOISE_HYSTERESIS_RATIO,
-      cooldownMs: NOISE_COOLDOWN_MS,
-    });
-    this.motionDetector = new ThresholdDetector({
-      now: this.now,
-      threshold: this.detectorSettings.motionThreshold,
-      sustainMs: MOTION_SUSTAIN_MS,
-      hysteresisRatio: MOTION_HYSTERESIS_RATIO,
-      cooldownMs: MOTION_COOLDOWN_MS,
+      audioContextFactory: opts.audioContextFactory,
+      createNoiseSource: opts.createNoiseSource,
+      createMotionSource: opts.createMotionSource,
+      detectors: opts.detectors,
     });
   }
 
@@ -264,31 +244,23 @@ export class CameraSession {
 
   /** Current detector settings (enabled flags + thresholds), for the Alerts panel UI. */
   getDetectorSettings(): DetectorSettings {
-    return { ...this.detectorSettings };
+    return this.detectors.getSettings();
   }
 
   setNoiseEnabled(enabled: boolean): void {
-    this.detectorSettings = { ...this.detectorSettings, noiseEnabled: enabled };
-    this.saveDetectorSettings();
-    this.syncNoiseSource();
+    this.detectors.setNoiseEnabled(enabled);
   }
 
   setMotionEnabled(enabled: boolean): void {
-    this.detectorSettings = { ...this.detectorSettings, motionEnabled: enabled };
-    this.saveDetectorSettings();
-    this.syncMotionSource();
+    this.detectors.setMotionEnabled(enabled);
   }
 
   setNoiseThreshold(threshold: number): void {
-    this.detectorSettings = { ...this.detectorSettings, noiseThreshold: threshold };
-    this.noiseDetector.setThreshold(threshold);
-    this.saveDetectorSettings();
+    this.detectors.setNoiseThreshold(threshold);
   }
 
   setMotionThreshold(threshold: number): void {
-    this.detectorSettings = { ...this.detectorSettings, motionThreshold: threshold };
-    this.motionDetector.setThreshold(threshold);
-    this.saveDetectorSettings();
+    this.detectors.setMotionThreshold(threshold);
   }
 
   /**
@@ -301,9 +273,7 @@ export class CameraSession {
    * the same element leaves the running source untouched.
    */
   attachMotionSource(videoEl: HTMLVideoElement | null): void {
-    if (this.motionVideoEl === videoEl) return;
-    this.motionVideoEl = videoEl;
-    this.syncMotionSource();
+    this.detectors.attachMotionSource(videoEl);
   }
 
   /**
@@ -315,6 +285,24 @@ export class CameraSession {
     cb(this.state);
     return () => {
       this.stateCbs = this.stateCbs.filter((f) => f !== cb);
+    };
+  }
+
+  /**
+   * Subscribe to talk-back (Task 12) audio from connected viewers. Fires
+   * immediately with the current list (same convention as onState), then on
+   * every change — a viewer starting/stopping a PTT press doesn't itself
+   * change this list (see the design note on CameraSession.PeerLike.onTrack:
+   * the transceiver/track exists once negotiated regardless of press state),
+   * but a viewer's Peer being adopted or leaving does. Kept deliberately
+   * simple (whole-list callback) rather than a per-peerId callback — the UI
+   * only needs to render "one hidden <audio> per current entry".
+   */
+  onRemoteAudio(cb: (entries: RemoteAudioEntry[]) => void): () => void {
+    this.remoteAudioCbs.push(cb);
+    cb(this.remoteAudioEntries());
+    return () => {
+      this.remoteAudioCbs = this.remoteAudioCbs.filter((f) => f !== cb);
     };
   }
 
@@ -334,6 +322,7 @@ export class CameraSession {
     }
     this.running = true;
     this.stream = stream;
+    this.detectors.setRunning(true);
     this.setState({ phase: 'connecting' });
     this.ensureSubscribed();
     this.signaling.connect();
@@ -359,8 +348,8 @@ export class CameraSession {
     for (const id of [...this.peers.keys()]) this.removePeer(id);
     this.releaseMedia();
     this.releaseWakeLock();
-    this.attachMotionSource(null);
-    this.syncNoiseSource(); // running=false: tears the noise source (and its AudioContext) down
+    this.detectors.attachMotionSource(null);
+    this.detectors.setRunning(false); // tears down both the noise (+ its AudioContext) and motion sources
     this.storage.removeItem(STORAGE_CODE_KEY);
     this.storage.removeItem(STORAGE_TOKEN_KEY);
     this.location.hash = '';
@@ -423,10 +412,10 @@ export class CameraSession {
             viewerUrl: `${this.location.origin}/viewer.html#${msg.code}`,
             error: undefined,
           });
-          // Noise detection needs phase 'live' (see syncNoiseSource); motion
-          // is synced too in case attachMotionSource() ran before this point.
-          this.syncNoiseSource();
-          this.syncMotionSource();
+          // Noise detection needs phase 'live' (see DetectorController.
+          // syncNoiseSource); motion is re-synced too in case
+          // attachMotionSource() ran before this point.
+          this.detectors.setLive(true);
           return;
         }
         case 'peer-joined':
@@ -526,10 +515,18 @@ export class CameraSession {
    * so a clean rebuild beats reconciling stale state. Note: signals queued
    * during the outage flush BEFORE onReconnected fires (SignalingClient
    * contract) — the relay answers those with error:invalid; acceptable noise.
+   *
+   * Also pauses noise detection for the reconnect window (phase leaves
+   * 'live') — Task 12 review fix: previously nothing re-evaluated
+   * DetectorController's run condition here, so a noise source kept
+   * sampling/firing through a reconnect despite the "avoids spurious
+   * pre-pairing alerts" doc promise on syncNoiseSource. It resumes
+   * automatically once the reclaim's room-created lands (setLive(true)).
    */
   private handleReconnected(): void {
     if (!this.running) return;
     for (const id of [...this.peers.keys()]) this.removePeer(id);
+    this.detectors.setLive(false);
     this.setState({ phase: 'connecting', viewerCount: 0 });
     this.runEntryLadder();
   }
@@ -583,6 +580,19 @@ export class CameraSession {
         rec.connState = s;
       }),
     );
+    // Task 12 (talk-back): the viewer pre-negotiates a sendonly audio
+    // transceiver at its own adopt time (see viewer/session.ts's adoptPeer),
+    // so this fires once that negotiation lands here — independent of
+    // whether the viewer has actually pressed PTT yet (see onRemoteAudio's
+    // doc). Filter to 'audio': this app never negotiates any other inbound
+    // kind on the camera side.
+    rec.unsubs.push(
+      peer.onTrack((ev) => {
+        if (ev.track.kind !== 'audio') return;
+        const stream = ev.streams[0];
+        this.setRemoteAudio(remotePeerId, stream === undefined ? null : stream);
+      }),
+    );
     // onDataOpen is edge-triggered; cover an already-open channel (defensive —
     // for role 'camera' the channel is created pre-offer and can't be open yet).
     if (peer.isDataOpen) this.startHeartbeat(rec);
@@ -602,6 +612,7 @@ export class CameraSession {
     rec.hbTimer = null;
     for (const unsub of rec.unsubs) unsub();
     rec.peer.close();
+    this.setRemoteAudio(remotePeerId, null); // that viewer's PTT audio (if any) is gone with it
     this.setState({ viewerCount: this.peers.size });
   }
 
@@ -625,8 +636,8 @@ export class CameraSession {
     for (const id of [...this.peers.keys()]) this.removePeer(id);
     this.releaseMedia();
     this.releaseWakeLock();
-    this.attachMotionSource(null);
-    this.syncNoiseSource();
+    this.detectors.attachMotionSource(null);
+    this.detectors.setRunning(false);
     this.setState({ phase: 'error', error: message, viewerCount: 0 });
   }
 
@@ -642,142 +653,37 @@ export class CameraSession {
     this.stream = null;
   }
 
-  // -- detectors (Task 11) -----------------------------------------------
+  // -- detectors (Task 11 logic; see DetectorController in detectors.ts) -----
 
   /**
    * Broadcast an alert event to ALL connected peers over the existing
    * heartbeat data channel — fire-and-forget (Peer.sendData no-ops and
    * returns false on a dead/not-yet-open channel; nothing here checks the
-   * return value, same as the heartbeat sender above).
+   * return value, same as the heartbeat sender above). Passed to
+   * DetectorController as its onAlert callback; this is the one piece of
+   * detector-adjacent logic that stays here since it's pure data-channel
+   * transport, not detection logic.
    */
   private broadcastAlert(kind: 'noise' | 'motion'): void {
     const msg = JSON.stringify({ t: 'alert', kind, at: this.now() });
     for (const rec of this.peers.values()) rec.peer.sendData(msg);
   }
 
-  private handleNoiseSample(rms: number): void {
-    if (this.noiseDetector.sample(rms)) this.broadcastAlert('noise');
+  // -- talk-back (Task 12) -----------------------------------------------
+
+  private remoteAudioEntries(): RemoteAudioEntry[] {
+    return [...this.remoteAudio.entries()].map(([peerId, stream]) => ({ peerId, stream }));
   }
 
-  private handleMotionSample(fraction: number): void {
-    if (this.motionDetector.sample(fraction)) this.broadcastAlert('motion');
-  }
-
-  /**
-   * Starts/stops the noise source to match current conditions: running,
-   * phase 'live' (avoids spurious pre-pairing alerts), noise enabled, and a
-   * stream to listen to. Construction is guarded — AudioContext can throw in
-   * unsupported browsers; noise detection is best-effort and never blocks
-   * the core video stream. Idempotent: a call that changes nothing (source
-   * already matches the desired run state) is a no-op.
-   */
-  private syncNoiseSource(): void {
-    const shouldRun =
-      this.running &&
-      this.state.phase === 'live' &&
-      this.detectorSettings.noiseEnabled &&
-      this.stream !== null;
-    if (shouldRun && this.noiseSource === null) {
-      try {
-        if (this.noiseAudioCtx === null) this.noiseAudioCtx = this.audioContextFactory();
-        this.noiseSource = this.createNoiseSourceFn(this.stream!, this.noiseAudioCtx, (rms) =>
-          this.handleNoiseSample(rms),
-        );
-      } catch (err) {
-        console.warn('[camera-session] noise detection unavailable', err);
-      }
-    } else if (!shouldRun && this.noiseSource !== null) {
-      this.noiseSource.stop();
-      this.noiseSource = null;
-      // .close() returns a Promise that can REJECT (e.g. an already-closed
-      // context) — a synchronous try/catch never sees that; .catch() is the
-      // established pattern in this codebase for exactly this shape (see
-      // releaseWakeLock below and ViewerSession.unmute()).
-      const ctx = this.noiseAudioCtx as unknown as { close?: () => Promise<void> } | null;
-      try {
-        void ctx?.close?.()?.catch(() => {});
-      } catch {
-        // Non-fatal: the context is being discarded either way.
-      }
-      this.noiseAudioCtx = null;
+  private setRemoteAudio(peerId: string, stream: MediaStream | null): void {
+    if (stream === null) {
+      if (!this.remoteAudio.has(peerId)) return; // no-op: nothing to clear
+      this.remoteAudio.delete(peerId);
+    } else {
+      this.remoteAudio.set(peerId, stream);
     }
-  }
-
-  /**
-   * Starts/stops the motion source to match current conditions: running,
-   * motion enabled, and a preview element attached (see attachMotionSource's
-   * doc — motion only runs while the preview element exists, acceptable v1).
-   */
-  private syncMotionSource(): void {
-    const shouldRun =
-      this.running && this.detectorSettings.motionEnabled && this.motionVideoEl !== null;
-    if (shouldRun && this.motionSource === null) {
-      this.motionSource = this.createMotionSourceFn(this.motionVideoEl!, (fraction) =>
-        this.handleMotionSample(fraction),
-      );
-    } else if (!shouldRun && this.motionSource !== null) {
-      this.motionSource.stop();
-      this.motionSource = null;
-    }
-  }
-
-  /**
-   * Load persisted detector settings. Storage always wins once a setting has
-   * been written (survives across page reloads); `overrides` (test seam) and
-   * then the spec defaults are only used for whatever storage doesn't have.
-   */
-  private loadDetectorSettings(overrides?: Partial<DetectorSettings>): DetectorSettings {
-    return {
-      // Default OFF: both detectors are opt-in (Alerts panel toggles) rather
-      // than silently starting a microphone-level analyser / canvas sampler
-      // the moment a session goes live. Once a user flips a toggle, THAT
-      // choice is what persists across reloads (readBoolSetting below).
-      noiseEnabled: this.readBoolSetting(
-        STORAGE_DETECT_NOISE_ENABLED_KEY,
-        overrides?.noiseEnabled ?? false,
-      ),
-      motionEnabled: this.readBoolSetting(
-        STORAGE_DETECT_MOTION_ENABLED_KEY,
-        overrides?.motionEnabled ?? false,
-      ),
-      noiseThreshold: this.readNumSetting(
-        STORAGE_DETECT_NOISE_THRESHOLD_KEY,
-        overrides?.noiseThreshold ?? DEFAULT_NOISE_THRESHOLD,
-      ),
-      motionThreshold: this.readNumSetting(
-        STORAGE_DETECT_MOTION_THRESHOLD_KEY,
-        overrides?.motionThreshold ?? DEFAULT_MOTION_THRESHOLD,
-      ),
-    };
-  }
-
-  private saveDetectorSettings(): void {
-    this.storage.setItem(STORAGE_DETECT_NOISE_ENABLED_KEY, String(this.detectorSettings.noiseEnabled));
-    this.storage.setItem(
-      STORAGE_DETECT_MOTION_ENABLED_KEY,
-      String(this.detectorSettings.motionEnabled),
-    );
-    this.storage.setItem(
-      STORAGE_DETECT_NOISE_THRESHOLD_KEY,
-      String(this.detectorSettings.noiseThreshold),
-    );
-    this.storage.setItem(
-      STORAGE_DETECT_MOTION_THRESHOLD_KEY,
-      String(this.detectorSettings.motionThreshold),
-    );
-  }
-
-  private readBoolSetting(key: string, fallback: boolean): boolean {
-    const raw = this.storage.getItem(key);
-    if (raw === null) return fallback;
-    return raw === 'true';
-  }
-
-  private readNumSetting(key: string, fallback: number): number {
-    const raw = this.storage.getItem(key);
-    if (raw === null) return fallback;
-    const n = Number(raw);
-    return Number.isFinite(n) ? n : fallback;
+    const entries = this.remoteAudioEntries();
+    for (const cb of [...this.remoteAudioCbs]) cb(entries);
   }
 
   // -- wake lock --------------------------------------------------------------

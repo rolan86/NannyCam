@@ -177,7 +177,8 @@ export class ViewerMonitor {
       case 'alert': {
         const kind = (msg as { kind?: unknown }).kind;
         const at = (msg as { at?: unknown }).at;
-        if ((kind !== 'noise' && kind !== 'motion') || typeof at !== 'number') return;
+        if ((kind !== 'noise' && kind !== 'motion') || typeof at !== 'number' || !Number.isFinite(at))
+          return;
         for (const cb of [...this.alertCbs]) cb(kind, at);
         return;
       }
