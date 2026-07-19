@@ -113,21 +113,97 @@ describe('Watchdog — frame-stall detection', () => {
     expect(wd.tick()).toBe('live');
   });
 
-  test('a frame count that goes DOWN (peer replaced, fresh RTCStats counter) resets the stall clock', () => {
+  test('a DECREASE within the same generation never counts as an advance (framesDecoded is monotonic per SSRC)', () => {
     const { t, now } = makeClock();
     const wd = new Watchdog({ now });
     wd.onHeartbeat();
-    wd.onFrameCount(500); // old peer's high count
+    wd.onFrameCount(500); // high-water mark set at t=0
     t.ms = 4000;
     wd.onHeartbeat();
-    wd.onFrameCount(0); // new peer's fresh counter — lower, but it's a change
-    expect(wd.tick()).toBe('live'); // must not be treated as "unchanged for 4000ms"
+    wd.onFrameCount(0); // a real decrease within ONE generation is never genuine — must be ignored
+    expect(wd.tick()).toBe('live'); // stall clock still measured from t=0's high, only 4000ms elapsed
 
-    // Now genuinely stalls at 0 for >5000ms.
-    t.ms = 4000 + 5_001;
+    // Genuinely stalls (no NEW high above 500) for >5000ms since the real high-water mark.
+    t.ms = 5_001;
     wd.onHeartbeat();
     wd.onFrameCount(0);
     expect(wd.tick()).toBe('down');
+  });
+
+  test('an oscillating counter (0<->500 flapping, e.g. unstable stats report iteration order) trips DOWN after 5s of no NEW high', () => {
+    const { t, now } = makeClock();
+    const wd = new Watchdog({ now });
+    wd.onHeartbeat();
+    wd.onFrameCount(500); // high-water mark set at t=0 — this is the ONLY genuine advance
+    for (const dt of [500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500]) {
+      t.ms = dt;
+      wd.onHeartbeat();
+      // Oscillates but never exceeds the existing high-water mark of 500.
+      wd.onFrameCount(dt % 1000 === 0 ? 0 : 500);
+      expect(wd.tick()).toBe('live'); // still within 5000ms of the real high at t=0
+    }
+    t.ms = 5_001;
+    wd.onHeartbeat();
+    wd.onFrameCount(0);
+    expect(wd.tick()).toBe('down');
+  });
+
+  test('post-adoption: the new generation restarts at 0 and can advance/stall entirely independently', () => {
+    const { t, now } = makeClock();
+    const wd = new Watchdog({ now });
+    wd.onHeartbeat();
+    wd.onFrameCount(500); // old peer, generation 0
+    wd.reset(); // adopt a new peer -> generation 1, frameBaseline cleared
+
+    t.ms = 100;
+    wd.onHeartbeat();
+    wd.onFrameCount(0); // new peer's fresh RTCStats counter, correctly tagged with the new generation
+    expect(wd.tick()).toBe('live'); // just a baseline set, no stall yet
+
+    t.ms = 100 + 100;
+    wd.onHeartbeat();
+    wd.onFrameCount(5); // 5 > 0: genuine advance in the new generation
+    expect(wd.tick()).toBe('live');
+
+    // And it can independently stall on its own schedule.
+    t.ms = 200 + 5_001;
+    wd.onHeartbeat();
+    wd.onFrameCount(5);
+    expect(wd.tick()).toBe('down');
+  });
+
+  test('a stale-generation sample is discarded entirely — no false-DOWN, no false-LIVE', () => {
+    const { t, now } = makeClock();
+    const wd = new Watchdog({ now });
+    const g0 = wd.currentGeneration;
+    wd.onHeartbeat();
+    wd.onFrameCount(100, g0);
+    t.ms = 1000;
+    wd.onHeartbeat();
+    wd.onFrameCount(200, g0); // advancing normally in generation 0
+    expect(wd.tick()).toBe('live');
+
+    wd.reset(); // simulates peer replacement: generation bumps to 1
+    const g1 = wd.currentGeneration;
+    expect(g1).not.toBe(g0);
+
+    // A slow in-flight getStats() sample dispatched BEFORE the reset
+    // resolves late, still tagged with the OLD generation. Neither a huge
+    // jump nor a drop from it may affect the new generation's tracking.
+    wd.onFrameCount(999_999, g0); // stale — discarded, must not look like a huge advance
+    wd.onFrameCount(0, g0); // stale — discarded, must not look like a stall-reset either
+
+    // The new generation's tracking is untouched by either stale sample and
+    // starts fresh from its own first correctly-tagged reading.
+    t.ms = 1100;
+    wd.onHeartbeat();
+    wd.onFrameCount(0, g1);
+    expect(wd.tick()).toBe('live');
+
+    t.ms = 1100 + 5_001;
+    wd.onHeartbeat();
+    wd.onFrameCount(0, g1);
+    expect(wd.tick()).toBe('down'); // generation 1 genuinely stalled on its own merits
   });
 });
 
@@ -190,19 +266,90 @@ describe('Watchdog — recovery', () => {
     expect(wd.tick()).toBe('live');
   });
 
-  test('reset() grants a fresh grace period (e.g. on peer adoption/replacement)', () => {
+  test('reset() while DOWN does NOT clear the alarm — only genuine new evidence does', () => {
     const { t, now } = makeClock();
     const wd = new Watchdog({ now });
     t.ms = 6001;
     expect(wd.tick()).toBe('down');
 
+    wd.reset(); // e.g. a new (possibly also-dead) peer got adopted
+    expect(wd.tick()).toBe('down'); // must NOT silence the active alarm
+
+    // Repeated resets with still zero real evidence: stays down.
     wd.reset();
-    // No heartbeat yet post-reset, but we are back inside a fresh grace window.
+    t.ms = 6100;
+    expect(wd.tick()).toBe('down');
+    wd.reset();
+    t.ms = 6200;
+    expect(wd.tick()).toBe('down');
+
+    // Only a genuine fresh heartbeat (+ frames advancing/no baseline, +
+    // non-failed connection — the normal recovery rule) clears it.
+    wd.onHeartbeat();
+    expect(wd.tick()).toBe('live');
+  });
+
+  test('reset() while LIVE does not fabricate extra grace beyond the ORIGINAL deadline', () => {
+    const { t, now } = makeClock();
+    const wd = new Watchdog({ now });
+
+    // A peer is adopted at t=3000, well before the original 6000ms grace
+    // window would expire; the watchdog is still live at that point.
+    t.ms = 3000;
+    expect(wd.tick()).toBe('live');
+    wd.reset();
+
+    // If reset() had shifted the deadline forward to 3000+6000=9000, this
+    // would still read 'live'. It must not: the ORIGINAL deadline (6000ms
+    // from construction) still governs.
+    t.ms = 6001;
+    expect(wd.tick()).toBe('down');
+  });
+
+  test('crash-loop: reset() every 5s (< the 6s grace window) with ZERO signals still alarms at the FIRST grace expiry, and stays down through every subsequent reset', () => {
+    const { t, now } = makeClock();
+    const wd = new Watchdog({ now });
+
+    // Ticks every 1s; reset() (simulating a repeatedly-failing reconnect
+    // that manages to re-adopt a peer, which then never sends anything)
+    // fires every 5s. A naive "reset() always grants a fresh window while
+    // live" implementation never reaches DOWN here, because each reset
+    // lands before the PREVIOUS fresh window would have expired (5000 <
+    // 6000) and re-arms it forever — that's the fuzzer-found unbounded
+    // grace/crash-loop hole this test guards against.
+    let trippedAt: number | null = null;
+    for (let ms = 1000; ms <= 20_000; ms += 1000) {
+      t.ms = ms;
+      if (ms % 5000 === 0) wd.reset();
+      const verdict = wd.tick();
+      if (verdict === 'down' && trippedAt === null) trippedAt = ms;
+    }
+
+    expect(trippedAt).not.toBeNull();
+    // Must trip at the first 1s-cadence tick STRICTLY past the ORIGINAL
+    // 6000ms deadline (i.e. 7000, since the 6000ms tick itself is exactly
+    // at, not past, the threshold) — not be deferred by the resets at
+    // 5000/10000/15000/20000 (a buggy unbounded-grace implementation would
+    // never trip within this 20s window at all).
+    expect(trippedAt).toBe(7000);
+    // ... and stays down all the way through, despite resets at 10000/15000/20000.
+    expect(wd.tick()).toBe('down');
+  });
+
+  test('genuine recovery still works normally shortly after a reset() (the intended peer-replacement flow)', () => {
+    const { t, now } = makeClock();
+    const wd = new Watchdog({ now });
+    wd.onHeartbeat();
+    t.ms = 1000;
     expect(wd.tick()).toBe('live');
 
-    // And the fresh window still expires on schedule if nothing else arrives.
-    t.ms += 6001;
-    expect(wd.tick()).toBe('down');
+    // Peer replaced (e.g. a brief signaling blip); the new peer's own
+    // heartbeats/frames arrive shortly after.
+    wd.reset();
+    t.ms = 1200;
+    wd.onHeartbeat();
+    wd.onFrameCount(1, wd.currentGeneration);
+    expect(wd.tick()).toBe('live'); // never even dipped — the blip was well under the grace window
   });
 });
 

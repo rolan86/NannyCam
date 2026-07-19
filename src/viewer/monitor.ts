@@ -35,8 +35,13 @@ export interface MonitorState {
   lastLiveAt: number | null;
   /**
    * Increments on every live->down transition (including the very first).
-   * The UI resets its "Silence" button on a change — silence must persist
-   * only until the NEXT down transition, not forever (spec requirement).
+   * NOT currently read by the UI: main.tsx's "Silence persists only until
+   * the next DOWN transition" requirement falls out for free from
+   * DownOverlay only ever being mounted while down is true — it fully
+   * unmounts and remounts (fresh useState) between any two down episodes,
+   * since a live period necessarily separates them. Kept as a diagnostic
+   * counter (episode boundaries are useful for tests/telemetry) even though
+   * nothing currently consumes it.
    */
   downEpisode: number;
 }
@@ -171,20 +176,41 @@ export class ViewerMonitor {
   private sample(): void {
     const wd = this.watchdog;
     if (wd === null) return;
-    void this.session.getStats().then((stats) => {
-      // Re-check: stopMonitoring() may have run while getStats() was in flight.
-      if (this.watchdog !== wd) return;
-      if (stats !== null) {
-        for (const report of stats.values()) {
-          if (report.type === 'inbound-rtp' && (report as { kind?: string }).kind === 'video') {
-            wd.onFrameCount((report as { framesDecoded?: number }).framesDecoded ?? 0);
-            break;
+    // Read the generation NOW, at dispatch time — not when the promise
+    // resolves. That's what lets a sample that resolves after an
+    // intervening reset() (peer replaced mid-flight) be recognized by
+    // Watchdog.onFrameCount as stale and discarded, rather than being read
+    // against the NEW generation's fresh (much smaller) counter.
+    const generation = wd.currentGeneration;
+    void this.session
+      .getStats()
+      // Safety-critical: a rejected getStats() (e.g. the peer closed mid-
+      // call) must not freeze the sampler at a stale verdict. Treat it as
+      // "no sample this round" and fall through to the unconditional tick()
+      // below, same as a resolved-but-empty (null) result.
+      .catch(() => null)
+      .then((stats) => {
+        // Re-check: stopMonitoring() may have run while getStats() was in flight.
+        if (this.watchdog !== wd) return;
+        if (stats !== null) {
+          // Sum across ALL inbound-rtp video reports rather than trusting
+          // the first one encountered — RTCStatsReport iteration order is
+          // not guaranteed stable across samples, so "take the first" can
+          // flap between reports (e.g. simulcast/multiple m-lines) and look
+          // like the count oscillating even on a healthy stream.
+          let total = 0;
+          let sawVideoReport = false;
+          for (const report of stats.values()) {
+            if (report.type === 'inbound-rtp' && (report as { kind?: string }).kind === 'video') {
+              sawVideoReport = true;
+              total += (report as { framesDecoded?: number }).framesDecoded ?? 0;
+            }
           }
+          if (sawVideoReport) wd.onFrameCount(total, generation);
         }
-      }
-      const verdict = wd.tick();
-      if (verdict === 'live') this.setState({ lastLiveAt: this.now() });
-    });
+        const verdict = wd.tick();
+        if (verdict === 'live') this.setState({ lastLiveAt: this.now() });
+      });
   }
 
   private publishVerdict(s: WatchdogState, reason: WatchdogReason): void {
