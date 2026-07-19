@@ -1,5 +1,8 @@
 // NannyCam peer wrapper — canonical perfect negotiation over the relay's
-// opaque `signal` payload. Camera = impolite, viewer = polite.
+// opaque `signal` payload. Camera = impolite, viewer = polite. Pattern:
+// https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API/Perfect_negotiation
+// Glare is real here: `negotiationneeded` fires independently on each side, so
+// both peers can send offers simultaneously; politeness decides who yields.
 //
 // NO STUN, NO TURN, EVER: `iceServers: []` is the spec's structural guarantee
 // that no third party touches the connection — host candidates only (LAN IPs
@@ -30,7 +33,8 @@ const isDescription = (v: unknown): v is RTCSessionDescriptionInit =>
   (v.sdp === undefined || typeof v.sdp === 'string');
 
 const isCandidate = (v: unknown): v is RTCIceCandidateInit | null =>
-  v === null || isRecord(v);
+  v === null ||
+  (isRecord(v) && ('candidate' in v || 'sdpMid' in v || 'sdpMLineIndex' in v));
 
 export class Peer {
   readonly remotePeerId: string;
@@ -44,6 +48,8 @@ export class Peer {
   private restarted = false;
   private warned = false;
   private closed = false;
+  // Callback lists are dispatched over a snapshot ([...list]) so a callback
+  // that unsubscribes (itself or a sibling) mid-dispatch can't skip the next.
   private stateCbs: Array<(s: RTCPeerConnectionState) => void> = [];
   private trackCbs: Array<(ev: RTCTrackEvent) => void> = [];
   private dataCbs: Array<(text: string) => void> = [];
@@ -74,17 +80,22 @@ export class Peer {
 
     this.pc.onconnectionstatechange = () => {
       const s = this.pc.connectionState;
-      if (s === 'connected') this.restarted = false;
+      if (s === 'connected') {
+        this.restarted = false;
+        // Re-arm warnOnce too: an early benign warn must not permanently
+        // silence a genuine failure in a later episode.
+        this.warned = false;
+      }
       if (s === 'failed' && !this.restarted) {
         // At most one automatic recovery attempt per failure episode; repeated
         // failures beyond this are the session layer's job (rung 2/3).
         this.restarted = true;
         this.pc.restartIce();
       }
-      for (const cb of this.stateCbs) cb(s);
+      for (const cb of [...this.stateCbs]) cb(s);
     };
 
-    this.pc.ontrack = (ev) => { for (const cb of this.trackCbs) cb(ev); };
+    this.pc.ontrack = (ev) => { for (const cb of [...this.trackCbs]) cb(ev); };
 
     if (opts.role === 'camera') {
       // Created in the constructor so the channel rides the first offer.
@@ -103,9 +114,13 @@ export class Peer {
   }
 
   /**
-   * Feed one inbound relay payload. Canonical perfect-negotiation receive side:
-   * impolite peer ignores colliding offers, polite peer rolls back (implicitly,
-   * via setRemoteDescription). Garbage is ignored silently; never rejects.
+   * Feed one inbound relay payload. Callers MUST await each call before
+   * feeding the next payload from the same peer — signals are order-dependent
+   * (concurrent calls corrupt signaling state). Canonical receive side:
+   * impolite peer ignores colliding offers; the polite peer needs no explicit
+   * rollback because parameterless-flavor setRemoteDescription(offer)
+   * auto-rolls-back an in-flight local offer — it abandons its own offer and
+   * answers instead. Garbage is ignored silently; never rejects.
    */
   async handleSignal(payload: unknown): Promise<void> {
     if (this.closed || !isRecord(payload)) return;
@@ -126,7 +141,9 @@ export class Peer {
         try {
           await this.pc.addIceCandidate(payload.candidate ?? undefined);
         } catch (err) {
-          // Candidate errors while ignoring an offer are expected (canonical).
+          // Candidates belonging to an offer we discarded don't match our
+          // remote description, so these errors are expected — swallow them
+          // while ignoring an offer (canonical pattern).
           if (!this.ignoreOffer) throw err;
         }
       }
@@ -154,6 +171,20 @@ export class Peer {
     try { this.channel?.close(); this.pc.close(); } catch { /* already closed */ }
   }
 
+  /** True while the 'nannycam' data channel is open. */
+  get isDataOpen(): boolean {
+    return this.channel?.readyState === 'open';
+  }
+
+  /** Raw stats snapshot (e.g. Task 10's framesDecoded watchdog). */
+  getStats(): Promise<RTCStatsReport> {
+    return this.pc.getStats();
+  }
+
+  // Each on* method returns an unsubscribe closure (same convention as
+  // SignalingClient); without calling it, the registration lasts the peer's
+  // lifetime.
+
   onConnectionState(cb: (s: RTCPeerConnectionState) => void): () => void {
     return subscribe(this.stateCbs, cb);
   }
@@ -166,16 +197,20 @@ export class Peer {
     return subscribe(this.dataCbs, cb);
   }
 
+  /**
+   * Fires when the data channel opens. Edge-triggered: a subscriber added
+   * AFTER the channel is already open does not fire — check isDataOpen first.
+   */
   onDataOpen(cb: () => void): () => void {
     return subscribe(this.openCbs, cb);
   }
 
   private attachChannel(ch: RTCDataChannel): void {
     this.channel = ch;
-    ch.onopen = () => { for (const cb of this.openCbs) cb(); };
+    ch.onopen = () => { for (const cb of [...this.openCbs]) cb(); };
     ch.onmessage = (ev) => {
       if (typeof ev.data !== 'string') return; // text frames only
-      for (const cb of this.dataCbs) cb(ev.data);
+      for (const cb of [...this.dataCbs]) cb(ev.data);
     };
   }
 
