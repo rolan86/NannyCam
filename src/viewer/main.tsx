@@ -15,6 +15,12 @@ const session = new ViewerSession({
   location: window.location,
 });
 
+// Test hook (Task 9 e2e): expose the session so Playwright can read
+// getStats() directly (framesDecoded) without reimplementing WebRTC stats
+// polling in the page. Read-only access from tests; harmless in prod — it
+// does not add any surface a user action can reach.
+(window as unknown as { __nannycam: ViewerSession }).__nannycam = session;
+
 /** Human-readable status line: phase + camera presence (Task 9 asserts it). */
 function statusText(state: ViewerState): string {
   const camera = state.cameraPresent ? 'camera present' : 'camera offline';
