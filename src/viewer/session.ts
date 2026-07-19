@@ -206,7 +206,8 @@ export class ViewerSession {
   /**
    * Fires whenever a camera Peer is (re)created — the first one at initial
    * join, and again on every reclaim/reconnect replacement. Gap identified
-   * while wiring Task 10: the watchdog needs to reset() (fresh grace period)
+   * while wiring Task 10: the watchdog needs to reset() (bump generation /
+   * clear the frame high-water mark — NOT a fresh alarm grace period)
    * exactly at adoption time, BEFORE the new peer's track/heartbeats arrive,
    * and no existing hook signals that moment (onConnectionState/
    * onDataMessage are peer-content streams, not an adoption edge). Fires
