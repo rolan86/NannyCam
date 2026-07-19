@@ -17,6 +17,7 @@ import { ViewerMonitor, type MonitorState } from './monitor.ts';
 import {
   ViewerSession,
   type PeerLike,
+  type RtpTransceiverLike,
   type SignalingLike,
   type TrackEventLike,
 } from './session.ts';
@@ -80,6 +81,11 @@ class MockPeer implements PeerLike {
   }
   getStats(): Promise<RTCStatsReport> {
     return Promise.resolve(this.statsResult);
+  }
+  // Task 12: this suite doesn't exercise talk-back; a bare stub satisfies
+  // the interface (ViewerSession.adoptPeer calls it unconditionally).
+  addTransceiver(): RtpTransceiverLike {
+    return { sender: { replaceTrack: () => Promise.resolve() } };
   }
 
   // -- test drivers --

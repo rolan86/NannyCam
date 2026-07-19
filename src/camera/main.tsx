@@ -12,7 +12,12 @@ import {
   sensitivityToThreshold,
   thresholdToSensitivity,
 } from './detectors.ts';
-import { CameraSession, type CameraState, type DetectorSettings } from './session.ts';
+import {
+  CameraSession,
+  type CameraState,
+  type DetectorSettings,
+  type RemoteAudioEntry,
+} from './session.ts';
 import './camera.css';
 
 const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
@@ -22,6 +27,14 @@ const session = new CameraSession({
   storage: localStorage,
   location: window.location,
 });
+
+// Test hook (Task 12 e2e), mirroring the viewer hook (src/viewer/main.tsx,
+// same comment style): exposes the full session so Playwright can assert
+// talk-back wiring (onRemoteAudio / a viewer's inbound mic track) from the
+// camera side without reimplementing WebRTC track inspection in the page.
+// Same broad-surface trust-model caveat as the viewer hook — Task 14
+// narrows both before the app reaches any less-trusted context.
+(window as unknown as { __nannycam: CameraSession }).__nannycam = session;
 
 /**
  * Collapsible "Alerts" panel (Task 11): two enable toggles + two sensitivity
@@ -129,15 +142,42 @@ function AlertsPanel({
   );
 }
 
+/**
+ * Task 12 (talk-back) hidden audio sinks: one per current onRemoteAudio
+ * entry, keyed by peerId so Preact reconciles by identity rather than
+ * position. No `controls` attribute and CSS `display: none` (see
+ * camera.css) — these exist purely to play PTT audio, never to be seen.
+ */
+function RemoteAudioSinks({ entries }: { entries: RemoteAudioEntry[] }) {
+  return (
+    <>
+      {entries.map((e) => (
+        <audio
+          key={e.peerId}
+          class="remote-audio"
+          autoPlay
+          data-testid="remote-audio"
+          data-peer-id={e.peerId}
+          ref={(el) => {
+            if (el !== null && el.srcObject !== e.stream) el.srcObject = e.stream;
+          }}
+        />
+      ))}
+    </>
+  );
+}
+
 function App() {
   const [state, setState] = useState<CameraState>({ phase: 'idle', viewerCount: 0 });
   const [detectors, setDetectors] = useState<DetectorSettings>(() =>
     session.getDetectorSettings(),
   );
+  const [remoteAudio, setRemoteAudio] = useState<RemoteAudioEntry[]>([]);
   const videoRef = useRef<HTMLVideoElement>(null);
   const qrRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => session.onState(setState), []);
+  useEffect(() => session.onRemoteAudio(setRemoteAudio), []);
 
   // Attach the local preview stream whenever the phase changes (the stream
   // exists from 'connecting' onward and is dropped on stop).
@@ -206,6 +246,7 @@ function App() {
           <button class="danger" onClick={onStop}>
             Stop camera
           </button>
+          <RemoteAudioSinks entries={remoteAudio} />
         </main>
       );
     case 'stopped':

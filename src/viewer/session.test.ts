@@ -9,6 +9,7 @@ import {
   normalizeCode,
   type AudioContextLike,
   type PeerLike,
+  type RtpTransceiverLike,
   type SignalingLike,
   type TrackEventLike,
   type ViewerState,
@@ -50,6 +51,27 @@ class MockSignaling implements SignalingLike {
   }
 }
 
+/** Records replaceTrack calls; drivable/inspectable from tests. */
+class MockTransceiver implements RtpTransceiverLike {
+  readonly kind: 'audio' | 'video';
+  readonly init: RTCRtpTransceiverInit | undefined;
+  readonly replaceTrackCalls: Array<MediaStreamTrack | null> = [];
+  readonly sender: RtpTransceiverLike['sender'] & { track: MediaStreamTrack | null };
+
+  constructor(kind: 'audio' | 'video', init: RTCRtpTransceiverInit | undefined) {
+    this.kind = kind;
+    this.init = init;
+    this.sender = {
+      track: null,
+      replaceTrack: (track: MediaStreamTrack | null): Promise<void> => {
+        this.sender.track = track;
+        this.replaceTrackCalls.push(track);
+        return Promise.resolve();
+      },
+    };
+  }
+}
+
 class MockPeer implements PeerLike {
   readonly remotePeerId: string;
   readonly sendSignal: (payload: unknown) => void;
@@ -58,6 +80,8 @@ class MockPeer implements PeerLike {
   started: unknown[] = [];
   /** Token report returned by getStats (identity-checked in tests). */
   statsResult = { peer: this } as unknown as RTCStatsReport;
+  /** Task 12: every addTransceiver() call, in order. */
+  transceivers: MockTransceiver[] = [];
   private resolvers: Array<() => void> = [];
   private trackCbs: Array<(ev: TrackEventLike) => void> = [];
   private dataCbs: Array<(text: string) => void> = [];
@@ -96,6 +120,11 @@ class MockPeer implements PeerLike {
   getStats(): Promise<RTCStatsReport> {
     return Promise.resolve(this.statsResult);
   }
+  addTransceiver(kind: 'audio' | 'video', init?: RTCRtpTransceiverInit): RtpTransceiverLike {
+    const t = new MockTransceiver(kind, init);
+    this.transceivers.push(t);
+    return t;
+  }
 
   // -- test drivers --
   emitTrack(stream: MediaStream): void {
@@ -131,7 +160,63 @@ function fakeStream(id: string): MediaStream {
   return { id } as unknown as MediaStream;
 }
 
-function makeHarness(opts: { hash?: string } = {}) {
+interface FakeMicTrack extends MediaStreamTrack {
+  stopped: boolean;
+}
+
+function fakeMicTrack(): FakeMicTrack {
+  const t = {
+    kind: 'audio',
+    enabled: true,
+    stopped: false,
+    stop() {
+      t.stopped = true;
+    },
+  };
+  return t as unknown as FakeMicTrack;
+}
+
+/**
+ * Controllable getUserMedia seam (Task 12): each startTalk() call awaits a
+ * promise this object holds open until the test explicitly resolves/rejects
+ * it — lets tests exercise the "released/replaced while awaiting the mic
+ * prompt" races deterministically.
+ */
+function makeMicSeam() {
+  const pending: Array<{ resolve: (s: MediaStream) => void; reject: (e: unknown) => void }> = [];
+  const tracks: FakeMicTrack[] = [];
+  const getMic = (): Promise<MediaStream> =>
+    new Promise((resolve, reject) => {
+      pending.push({ resolve, reject });
+    });
+  return {
+    getMic,
+    calls: () => pending.length + tracks.length, // total ever requested (settled + pending)
+    /** Resolve the oldest pending call with a fresh one-track stream; returns that track. */
+    resolveNext(): FakeMicTrack {
+      const p = pending.shift();
+      if (p === undefined) throw new Error('no pending getMic call');
+      const track = fakeMicTrack();
+      tracks.push(track);
+      p.resolve({ getAudioTracks: () => [track] } as unknown as MediaStream);
+      return track;
+    },
+    /** Resolve with a stream that has NO audio tracks (defensive edge case). */
+    resolveNextEmpty(): void {
+      const p = pending.shift();
+      if (p === undefined) throw new Error('no pending getMic call');
+      p.resolve({ getAudioTracks: () => [] } as unknown as MediaStream);
+    },
+    rejectNext(err: unknown = new Error('NotAllowedError')): void {
+      const p = pending.shift();
+      if (p === undefined) throw new Error('no pending getMic call');
+      p.reject(err);
+    },
+    pendingCount: () => pending.length,
+  };
+}
+
+function makeHarness(opts: { hash?: string; getMic?: () => Promise<MediaStream> } = {}) {
   const signaling = new MockSignaling();
   const location = { hash: opts.hash ?? '' };
   const peers: MockPeer[] = [];
@@ -152,6 +237,7 @@ function makeHarness(opts: { hash?: string } = {}) {
       audioContexts.push(c);
       return c;
     },
+    getMic: opts.getMic,
   });
   session.onState((s) => states.push(s));
   session.onRemoteStream((s) => streams.push(s));
@@ -626,5 +712,194 @@ describe('unsubscribe closures', () => {
     expect(streams.length).toBe(baseline.streams);
     expect(data).toEqual([]);
     expect(conns).toEqual([]);
+  });
+});
+
+// -- push-to-talk (Task 12) --------------------------------------------------
+
+/** Harness with a controllable mic seam, advanced to 'live' via cam-1's offer. */
+function liveWithMic() {
+  const mic = makeMicSeam();
+  const h = makeHarness({ getMic: mic.getMic });
+  h.session.join('ABCD2345');
+  h.signaling.receive({ ...ROOM_JOINED, cameraPresent: true });
+  h.signaling.receive({ type: 'signal', from: 'cam-1', payload: 'offer' });
+  return { ...h, mic, transceiver: h.peers[0]!.transceivers[0]! };
+}
+
+describe('push-to-talk', () => {
+  test('starts idle', () => {
+    const h = makeHarness();
+    expect(h.last().talk).toBe('idle');
+  });
+
+  test('adds a sendonly audio transceiver synchronously at adopt, before any press', () => {
+    const h = liveWithMic();
+    expect(h.peers[0]!.transceivers).toHaveLength(1);
+    expect(h.transceiver.kind).toBe('audio');
+    expect(h.transceiver.init).toEqual({ direction: 'sendonly' });
+    expect(h.transceiver.sender.track).toBeNull(); // no press yet
+    expect(h.last().talk).toBe('idle');
+  });
+
+  test('first press: requesting-mic → talking; mic acquired once, replaceTrack once, track enabled', async () => {
+    const h = liveWithMic();
+    const p = h.session.startTalk();
+    expect(h.last().talk).toBe('requesting-mic');
+    expect(h.mic.pendingCount()).toBe(1);
+
+    const track = h.mic.resolveNext();
+    await p;
+    expect(h.last().talk).toBe('talking');
+    expect(h.transceiver.replaceTrackCalls).toEqual([track]);
+    expect(h.transceiver.sender.track).toBe(track);
+    expect(track.enabled).toBe(true);
+  });
+
+  test('release disables the track and returns to idle without releasing it', async () => {
+    const h = liveWithMic();
+    const p = h.session.startTalk();
+    const track = h.mic.resolveNext();
+    await p;
+
+    h.session.stopTalk();
+    expect(h.last().talk).toBe('idle');
+    expect(track.enabled).toBe(false);
+    expect(track.stopped).toBe(false); // still acquired, just muted
+  });
+
+  test('release then a second press reuses the SAME track — no new getUserMedia/replaceTrack', async () => {
+    const h = liveWithMic();
+    const p = h.session.startTalk();
+    const track = h.mic.resolveNext();
+    await p;
+    h.session.stopTalk();
+
+    await h.session.startTalk();
+    expect(h.mic.pendingCount()).toBe(0); // no second getUserMedia call
+    expect(h.transceiver.replaceTrackCalls).toEqual([track]); // still just the one
+    expect(h.last().talk).toBe('talking');
+    expect(track.enabled).toBe(true);
+  });
+
+  test('startTalk while already talking/requesting is a no-op (idempotent)', async () => {
+    const h = liveWithMic();
+    const p = h.session.startTalk();
+    expect(h.mic.pendingCount()).toBe(1);
+    void h.session.startTalk(); // second call while requesting: no extra getUserMedia call
+    expect(h.mic.pendingCount()).toBe(1);
+    h.mic.resolveNext();
+    await p;
+
+    void h.session.startTalk(); // second call while talking: no-op
+    expect(h.mic.pendingCount()).toBe(0);
+  });
+
+  test('mic permission denial → mic-denied state; a later press retries', async () => {
+    const h = liveWithMic();
+    const p = h.session.startTalk();
+    expect(h.last().talk).toBe('requesting-mic');
+    h.mic.rejectNext();
+    await p;
+    expect(h.last().talk).toBe('mic-denied');
+    expect(h.transceiver.sender.track).toBeNull();
+
+    const p2 = h.session.startTalk();
+    expect(h.last().talk).toBe('requesting-mic'); // retried, not stuck on mic-denied
+    const track = h.mic.resolveNext();
+    await p2;
+    expect(h.last().talk).toBe('talking');
+    expect(track.enabled).toBe(true);
+  });
+
+  test('a mic stream with no audio tracks is treated as denied', async () => {
+    const h = liveWithMic();
+    const p = h.session.startTalk();
+    h.mic.resolveNextEmpty();
+    await p;
+    expect(h.last().talk).toBe('mic-denied');
+  });
+
+  test('release while awaiting the mic prompt: late resolution does not hot-mic', async () => {
+    const h = liveWithMic();
+    const p = h.session.startTalk();
+    expect(h.last().talk).toBe('requesting-mic');
+    h.session.stopTalk(); // released before the prompt resolves
+    expect(h.last().talk).toBe('idle');
+
+    const track = h.mic.resolveNext(); // prompt resolves late
+    await p;
+    expect(h.last().talk).toBe('idle'); // NOT talking
+    expect(track.enabled).toBe(false); // never enabled
+    expect(h.transceiver.replaceTrackCalls).toEqual([track]); // still attached, just muted
+  });
+
+  test('peer replacement while talking forces disabled + idle, reusing the SAME track (no new getUserMedia)', async () => {
+    const h = liveWithMic();
+    const p = h.session.startTalk();
+    const track = h.mic.resolveNext();
+    await p;
+    expect(h.last().talk).toBe('talking');
+
+    // Reclaimed camera under a fresh peerId (see the "camera peer" describe
+    // block above for the same replacement trigger).
+    h.signaling.receive({ type: 'signal', from: 'cam-2', payload: 'fresh-offer' });
+    expect(h.peers).toHaveLength(2);
+    const newTransceiver = h.peers[1]!.transceivers[0]!;
+    expect(newTransceiver.sender.track).toBe(track); // carried, no new prompt
+    expect(h.mic.pendingCount()).toBe(0);
+    expect(track.enabled).toBe(false); // forced disabled — never carry enabled=true
+    expect(h.last().talk).toBe('idle'); // requires a fresh press
+  });
+
+  test('peer replacement before any press: no track to carry, new transceiver sits empty', () => {
+    const h = liveWithMic();
+    h.signaling.receive({ type: 'signal', from: 'cam-2', payload: 'fresh-offer' });
+    const t = h.peers[1]!.transceivers[0]!;
+    expect(t.sender.track).toBeNull();
+    expect(t.replaceTrackCalls).toEqual([]);
+    expect(h.last().talk).toBe('idle');
+  });
+
+  test('leave() stops the mic track (device LED off) and resets talk to idle', async () => {
+    const h = liveWithMic();
+    const p = h.session.startTalk();
+    const track = h.mic.resolveNext();
+    await p;
+
+    h.session.leave();
+    expect(track.stopped).toBe(true);
+    expect(h.last().talk).toBe('idle');
+
+    // A subsequent press after leave()/re-join acquires a FRESH track.
+    h.session.join('ABCD2345');
+    h.signaling.receive({ ...ROOM_JOINED, cameraPresent: true });
+    h.signaling.receive({ type: 'signal', from: 'cam-3', payload: 'offer' });
+    void h.session.startTalk();
+    expect(h.mic.pendingCount()).toBe(1);
+  });
+
+  test("room-closed ('ended') stops the mic track too", async () => {
+    const h = liveWithMic();
+    const p = h.session.startTalk();
+    const track = h.mic.resolveNext();
+    await p;
+
+    h.signaling.receive({ type: 'room-closed' });
+    expect(track.stopped).toBe(true);
+    expect(h.last().talk).toBe('idle');
+  });
+
+  test('a fail() dead end (e.g. rate-limited) while talking releases the mic too — no stranded hot mic', async () => {
+    const h = liveWithMic();
+    const p = h.session.startTalk();
+    const track = h.mic.resolveNext();
+    await p;
+    expect(h.last().talk).toBe('talking');
+
+    h.signaling.receive({ type: 'error', reason: 'rate-limited' });
+    expect(h.last().phase).toBe('error');
+    expect(track.stopped).toBe(true);
+    expect(h.last().talk).toBe('idle');
   });
 });

@@ -126,13 +126,22 @@ class MockPeer implements PeerLike {
   setConnState(s: RTCPeerConnectionState): void {
     for (const cb of [...this.stateCbs]) cb(s);
   }
-  /** Task 12: simulate an inbound audio track (a viewer's PTT mic). */
+  /** Task 12: simulate an inbound audio track (a viewer's PTT mic) WITH an associated stream. */
   emitTrack(kind: 'audio' | 'video', stream: MediaStream): void {
-    for (const cb of [...this.trackCbs]) cb({ track: { kind }, streams: [stream] });
+    for (const cb of [...this.trackCbs]) {
+      cb({ track: { kind } as unknown as MediaStreamTrack, streams: [stream] });
+    }
   }
-  /** Task 12: a track event with no associated stream (defensive edge case). */
+  /**
+   * Task 12: a track event with NO associated stream — the real-world shape
+   * for the viewer's pre-negotiated PTT transceiver (addTransceiver with no
+   * `streams` init; see session.ts's onTrack wiring doc). The session must
+   * synthesize a stream via its createMediaStream seam.
+   */
   emitBareTrack(kind: 'audio' | 'video'): void {
-    for (const cb of [...this.trackCbs]) cb({ track: { kind }, streams: [] });
+    for (const cb of [...this.trackCbs]) {
+      cb({ track: { kind } as unknown as MediaStreamTrack, streams: [] });
+    }
   }
 }
 
@@ -291,6 +300,15 @@ function makeHarness(
   const states: CameraState[] = [];
   const noiseSources = makeFakeNoiseSourceFactory();
   const motionSources = makeFakeMotionSourceFactory();
+  // Task 12: fake MediaStream synthesis (the real `new MediaStream()` isn't
+  // available under bun test) — records every call so tests can assert on
+  // which tracks were bundled, and returns an identity-checkable fake.
+  const synthesizedStreams: Array<{ tracks: MediaStreamTrack[]; stream: MediaStream }> = [];
+  const createMediaStream = (mediaTracks: MediaStreamTrack[]): MediaStream => {
+    const s = { getTracks: () => mediaTracks } as unknown as MediaStream;
+    synthesizedStreams.push({ tracks: mediaTracks, stream: s });
+    return s;
+  };
   const session = new CameraSession({
     signaling,
     storage,
@@ -312,6 +330,7 @@ function makeHarness(
     createNoiseSource: noiseSources.factory,
     createMotionSource: motionSources.factory,
     detectors: opts.detectors,
+    createMediaStream,
   });
   session.onState((s) => states.push(s));
   const fireVisibility = (state: string) => {
@@ -322,6 +341,7 @@ function makeHarness(
   return {
     session, signaling, storage, location, stream, tracks, peers,
     intervals, wake, states, last, fireVisibility, noiseSources, motionSources,
+    synthesizedStreams,
   };
 }
 
@@ -919,14 +939,19 @@ describe('talk-back: onRemoteAudio', () => {
     expect(seen[seen.length - 1]).toEqual([]);
   });
 
-  test('a track event without streams is ignored (no phantom entry)', async () => {
+  test('a track event with no associated stream synthesizes one via createMediaStream', async () => {
+    // This IS the real shape for the viewer's PTT transceiver — see the
+    // onTrack wiring doc in session.ts: addTransceiver has no MediaStream to
+    // associate at adopt time, so ev.streams is normally empty in practice.
     const h = await live();
     h.signaling.receive({ type: 'peer-joined', peerId: 'viewer-1' });
     const seen: RemoteAudioEntry[][] = [];
     h.session.onRemoteAudio((entries) => seen.push(entries));
-    const baseline = seen.length;
+
     h.peers[0]!.emitBareTrack('audio');
-    expect(seen.length).toBe(baseline); // setRemoteAudio(id, null) no-ops: nothing was set
+    expect(h.synthesizedStreams).toHaveLength(1);
+    const synthesized = h.synthesizedStreams[0]!.stream;
+    expect(seen[seen.length - 1]).toEqual([{ peerId: 'viewer-1', stream: synthesized }]);
   });
 
   test('multiple viewers can each contribute an entry', async () => {

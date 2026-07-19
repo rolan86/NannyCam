@@ -43,6 +43,30 @@ button.primary { background: #2b7; color: #fff; }
 .down-overlay .down-lastlive { color: #ffd; font-size: 1.1rem; text-align: center; }
 .down-overlay button.silence { background: #fff; color: #b00000; font-weight: bold; }
 
+/* Task 12 — push-to-talk button: fixed bottom-right, above the video/waiting
+   text but below the DOWN overlay (z-index 1000) — you shouldn't be able to
+   "talk" to a camera the watchdog has already declared dead. touch-action:
+   none stops the browser from treating a long press as a scroll/zoom
+   gesture, which would otherwise fight the press-and-hold interaction. */
+.ptt-btn {
+  position: fixed;
+  right: 1rem;
+  bottom: 4.5rem;
+  z-index: 500;
+  width: 4.75rem;
+  height: 4.75rem;
+  border-radius: 50%;
+  background: #333;
+  color: #fff;
+  font-size: 0.8rem;
+  line-height: 1.2;
+  padding: 0.5rem;
+  touch-action: none;
+  user-select: none;
+}
+.ptt-btn.pressed { background: #2b7; }
+.ptt-btn.denied { background: #a33; }
+
 /* Task 11 — noise/motion alert banner: informational, NOT safety-critical,
    so it sits below the DOWN overlay (z-index 1000) — DOWN outranks alerts. */
 .alert-banner {

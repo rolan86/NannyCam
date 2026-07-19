@@ -22,3 +22,8 @@ button.danger { background: #d33; color: #fff; }
 .alerts-row { display: flex; align-items: center; gap: 0.6rem; color: #ccc; font-size: 0.95rem; }
 .alerts-row input[type='checkbox'] { width: 1.1rem; height: 1.1rem; }
 .slider-row input[type='range'] { flex: 1; }
+
+/* Task 12 — talk-back: one hidden <audio> sink per remote (viewer PTT)
+   stream. No `controls`, so this is already invisible by default; the rule
+   below is belt-and-braces against any future markup change. */
+.remote-audio { display: none; }

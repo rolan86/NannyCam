@@ -70,7 +70,7 @@ export interface SignalingLike {
 
 /** The slice of RTCTrackEvent the session reads; the real event satisfies it. */
 export interface TrackEventLike {
-  readonly track: { readonly kind: string };
+  readonly track: MediaStreamTrack;
   readonly streams: ReadonlyArray<MediaStream>;
 }
 
@@ -151,6 +151,18 @@ export interface CameraSessionOptions {
    * persisted in storage. Mainly a test seam; forwarded to DetectorController.
    */
   detectors?: Partial<DetectorSettings>;
+  /**
+   * MediaStream constructor seam (Task 12 talk-back); defaults to
+   * `new MediaStream(tracks)`. The viewer's PTT transceiver is added
+   * up-front with no associated stream (see viewer/session.ts's adoptPeer —
+   * there is no MediaStream to associate at addTransceiver time, only a
+   * bare track attached later via replaceTrack), so the inbound
+   * RTCTrackEvent's `streams` array is empty; this synthesizes a one-track
+   * MediaStream from `ev.track` so onRemoteAudio always hands the UI a
+   * playable stream. Also lets bun tests avoid the real (DOM-only)
+   * MediaStream constructor.
+   */
+  createMediaStream?: (tracks: MediaStreamTrack[]) => MediaStream;
 }
 
 interface PeerRecord {
@@ -180,6 +192,7 @@ export class CameraSession {
   private readonly wakeLockApi: WakeLockLike | undefined;
   private readonly visibility: VisibilityLike | undefined;
   private readonly now: () => number;
+  private readonly createMediaStream: (tracks: MediaStreamTrack[]) => MediaStream;
 
   private state: CameraState = { phase: 'idle', viewerCount: 0 };
   private stateCbs: Array<(s: CameraState) => void> = [];
@@ -225,6 +238,7 @@ export class CameraSession {
     this.visibility =
       opts.visibility ?? (typeof document !== 'undefined' ? document : undefined);
     this.now = opts.now ?? Date.now;
+    this.createMediaStream = opts.createMediaStream ?? ((tracks) => new MediaStream(tracks));
     this.detectors = new DetectorController({
       storage: this.storage,
       getStream: () => this.stream,
@@ -586,11 +600,20 @@ export class CameraSession {
     // whether the viewer has actually pressed PTT yet (see onRemoteAudio's
     // doc). Filter to 'audio': this app never negotiates any other inbound
     // kind on the camera side.
+    //
+    // ev.streams is normally EMPTY here, not populated: the viewer's
+    // addTransceiver() call has no MediaStream to associate at adopt time
+    // (only a bare track, attached later via replaceTrack on first press —
+    // see adoptPeer's doc), so the negotiated m-line carries no msid.
+    // Synthesize a one-track MediaStream from ev.track so onRemoteAudio
+    // always hands the UI something playable (confirmed against a real
+    // browser during Task 12's e2e run — the naive `ev.streams[0] ??
+    // return` version silently dropped every remote-audio entry).
     rec.unsubs.push(
       peer.onTrack((ev) => {
         if (ev.track.kind !== 'audio') return;
-        const stream = ev.streams[0];
-        this.setRemoteAudio(remotePeerId, stream === undefined ? null : stream);
+        const stream = ev.streams[0] ?? this.createMediaStream([ev.track]);
+        this.setRemoteAudio(remotePeerId, stream);
       }),
     );
     // onDataOpen is edge-triggered; cover an already-open channel (defensive —

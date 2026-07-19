@@ -190,6 +190,7 @@ function App() {
     phase: 'idle',
     cameraPresent: false,
     muted: true,
+    talk: 'idle',
   });
   const [monitorState, setMonitorState] = useState<MonitorState>({
     active: false,
@@ -332,6 +333,28 @@ function App() {
               onClick={() => session.unmute()}
             >
               Tap for sound
+            </button>
+          )}
+          {state.phase === 'live' && (
+            // Press-and-hold PTT (Task 12): visible only while live — a
+            // pre-negotiated mic transceiver already exists by this point
+            // (added synchronously at adoptPeer, before track events can
+            // flip the phase to 'live'). No mute-state gating: sending mic
+            // audio doesn't touch the shared AudioContext the tap-to-sound
+            // gesture unlocks, so PTT works even before that first tap.
+            // pointerleave is handled too (not just up/cancel) so a finger
+            // sliding off the button can't leave the mic hot.
+            <button
+              class={`ptt-btn${state.talk === 'talking' ? ' pressed' : ''}${
+                state.talk === 'mic-denied' ? ' denied' : ''
+              }`}
+              data-testid="ptt-btn"
+              onPointerDown={() => void session.startTalk()}
+              onPointerUp={() => session.stopTalk()}
+              onPointerCancel={() => session.stopTalk()}
+              onPointerLeave={() => session.stopTalk()}
+            >
+              {state.talk === 'mic-denied' ? 'Mic blocked — tap and allow access' : 'Hold to talk'}
             </button>
           )}
           {status}

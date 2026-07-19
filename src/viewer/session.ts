@@ -32,6 +32,16 @@ export type ViewerPhase =
   | 'ended'
   | 'error';
 
+/**
+ * Task 12 (push-to-talk) state machine:
+ *   'idle'            — released, no mic acquired yet (or acquired-but-off).
+ *   'requesting-mic'  — first press ever; awaiting the getUserMedia prompt.
+ *   'talking'         — mic track attached + enabled; audio is flowing.
+ *   'mic-denied'      — the getUserMedia prompt was denied/failed; the UI
+ *                        shows a hint. A later press retries getUserMedia.
+ */
+export type TalkState = 'idle' | 'requesting-mic' | 'talking' | 'mic-denied';
+
 export interface ViewerState {
   phase: ViewerPhase;
   roomCode?: string;
@@ -39,6 +49,8 @@ export interface ViewerState {
   cameraPresent: boolean;
   /** Starts true (autoplay policy); flipped by the unmute() gesture. */
   muted: boolean;
+  /** Push-to-talk state — see TalkState. */
+  talk: TalkState;
   error?: string;
 }
 
@@ -55,6 +67,16 @@ export interface TrackEventLike {
   readonly streams: ReadonlyArray<MediaStream>;
 }
 
+/** The slice of RTCRtpSender the session uses (Task 12 talk-back). */
+export interface RtpSenderLike {
+  replaceTrack(track: MediaStreamTrack | null): Promise<void>;
+}
+
+/** The slice of RTCRtpTransceiver the session uses; the real one satisfies it. */
+export interface RtpTransceiverLike {
+  readonly sender: RtpSenderLike;
+}
+
 /** The slice of Peer the session uses; the real Peer satisfies it as-is. */
 export interface PeerLike {
   readonly remotePeerId: string;
@@ -64,6 +86,8 @@ export interface PeerLike {
   onDataMessage(cb: (text: string) => void): () => void;
   onConnectionState(cb: (s: RTCPeerConnectionState) => void): () => void;
   getStats(): Promise<RTCStatsReport>;
+  /** Task 12 (talk-back): the viewer's outbound PTT mic transceiver. */
+  addTransceiver(kind: 'audio' | 'video', init?: RTCRtpTransceiverInit): RtpTransceiverLike;
 }
 
 /**
@@ -84,6 +108,11 @@ export interface ViewerSessionOptions {
   createPeer?: (opts: PeerOptions) => PeerLike;
   /** AudioContext seam; defaults to `new AudioContext()` (browser only). */
   audioContextFactory?: () => AudioContextLike;
+  /**
+   * Mic acquisition seam (Task 12 talk-back); defaults to
+   * `navigator.mediaDevices.getUserMedia({audio:true})`.
+   */
+  getMic?: () => Promise<MediaStream>;
 }
 
 /** Room codes: exactly CODE_LENGTH chars of the unambiguous alphabet. */
@@ -104,8 +133,14 @@ export class ViewerSession {
   private readonly location: { hash: string };
   private readonly createPeer: (opts: PeerOptions) => PeerLike;
   private readonly audioContextFactory: () => AudioContextLike;
+  private readonly getMic: () => Promise<MediaStream>;
 
-  private state: ViewerState = { phase: 'idle', cameraPresent: false, muted: true };
+  private state: ViewerState = {
+    phase: 'idle',
+    cameraPresent: false,
+    muted: true,
+    talk: 'idle',
+  };
   private stateCbs: Array<(s: ViewerState) => void> = [];
   private streamCbs: Array<(stream: MediaStream | null) => void> = [];
   private dataCbs: Array<(text: string) => void> = [];
@@ -135,12 +170,24 @@ export class ViewerSession {
   private subscribed = false;
   private audioCtx: AudioContextLike | null = null;
 
+  // -- talk-back (Task 12) -----------------------------------------------
+  /**
+   * The mic track acquired on the FIRST press, if any. Carried across peer
+   * replacements (no repeat getUserMedia prompt) — see adoptPeer's doc.
+   * Released (track.stop()) only on leave()/'ended' — see releaseMic().
+   */
+  private micTrack: MediaStreamTrack | null = null;
+  /** The current camera Peer's mic transceiver; re-added on every adoption. */
+  private micTransceiver: RtpTransceiverLike | null = null;
+
   constructor(opts: ViewerSessionOptions) {
     this.signaling = opts.signaling;
     this.location = opts.location;
     this.createPeer = opts.createPeer ?? ((o) => new Peer(o));
     this.audioContextFactory =
       opts.audioContextFactory ?? (() => new AudioContext());
+    this.getMic =
+      opts.getMic ?? (() => navigator.mediaDevices.getUserMedia({ audio: true }));
   }
 
   /**
@@ -287,6 +334,72 @@ export class ViewerSession {
   }
 
   /**
+   * Press-and-hold gesture, start half: pointerdown on the PTT button.
+   * First-ever call acquires the mic (getUserMedia) and attaches it to the
+   * pre-negotiated transceiver via replaceTrack — no renegotiation, since
+   * the m-line/transceiver already exists (added synchronously in
+   * adoptPeer). Subsequent calls just flip track.enabled — no repeat
+   * prompt, no repeat replaceTrack. Idempotent while already
+   * talking/requesting. Safe to call before a camera Peer exists in theory
+   * (the UI only renders the button while phase === 'live', by which point
+   * adoptPeer has already run at least once, so micTransceiver is set) —
+   * defensive null-checks below cover it anyway.
+   */
+  async startTalk(): Promise<void> {
+    const talk = this.state.talk;
+    if (talk === 'talking' || talk === 'requesting-mic') return;
+    if (this.micTrack === null) {
+      this.setState({ talk: 'requesting-mic' });
+      let stream: MediaStream;
+      try {
+        stream = await this.getMic();
+      } catch {
+        // Only surface mic-denied if the button is still held — a
+        // stopTalk() (release) during the prompt already reset to 'idle'
+        // and must not be clobbered by a late denial.
+        if (this.state.talk === 'requesting-mic') this.setState({ talk: 'mic-denied' });
+        return;
+      }
+      const track = stream.getAudioTracks()[0];
+      if (track === undefined) {
+        if (this.state.talk === 'requesting-mic') this.setState({ talk: 'mic-denied' });
+        return;
+      }
+      track.enabled = false; // flipped true below only if the press is still live
+      this.micTrack = track;
+      if (this.micTransceiver !== null) {
+        try {
+          await this.micTransceiver.sender.replaceTrack(track);
+        } catch {
+          // Non-fatal: PTT audio just won't flow; the rest of the session
+          // (video, alerts, etc.) is unaffected.
+        }
+      }
+      // The button may have been released while awaiting getUserMedia/
+      // replaceTrack above (or the peer/session torn down entirely) — don't
+      // hot-mic a press that already ended.
+      if (this.state.talk !== 'requesting-mic') return;
+    }
+    this.micTrack.enabled = true;
+    this.setState({ talk: 'talking' });
+  }
+
+  /**
+   * Press-and-hold gesture, release half: pointerup/pointercancel/
+   * pointerleave on the PTT button. Disables the track (audio stops
+   * flowing) without releasing it — the mic stays acquired (no LED-off) so
+   * the NEXT press is instant. Safe to call any time, including with no mic
+   * acquired yet or while idle (no-op beyond the enabled flip, which itself
+   * no-ops on a null track).
+   */
+  stopTalk(): void {
+    if (this.micTrack !== null) this.micTrack.enabled = false;
+    if (this.state.talk === 'talking' || this.state.talk === 'requesting-mic') {
+      this.setState({ talk: 'idle' });
+    }
+  }
+
+  /**
    * Local teardown: close the Peer, drop the stream, back to 'idle'. The
    * protocol has no leave message — the relay only removes a viewer when its
    * socket closes, so closing the page is the REAL leave. The signaling
@@ -299,12 +412,14 @@ export class ViewerSession {
   leave(): void {
     this.closePeer();
     this.setRemoteStream(null);
+    this.releaseMic();
     this.activeCode = null;
     this.setState({
       phase: 'idle',
       roomCode: undefined,
       cameraPresent: false,
       error: undefined,
+      talk: 'idle',
     });
   }
 
@@ -388,7 +503,8 @@ export class ViewerSession {
           // deliberate teardown, NOT an alarm (Task 10 distinguishes DOWN).
           this.closePeer();
           this.setRemoteStream(null);
-          this.setState({ phase: 'ended', cameraPresent: false });
+          this.releaseMic();
+          this.setState({ phase: 'ended', cameraPresent: false, talk: 'idle' });
           return;
         case 'error':
           return this.handleErrorReason(msg.reason);
@@ -481,13 +597,24 @@ export class ViewerSession {
   /**
    * Create the camera Peer, replacing (closing) any prior one.
    *
-   * Task 12 (push-to-talk) note: the viewer's mic transceiver must be added
-   * HERE, synchronously at adopt time — i.e. re-added on EVERY adoption, so
-   * a replaced (reclaimed) camera gets it too, with the PTT enabled-state
-   * carried across replacements. Adding it at adopt time pre-negotiates the
-   * m-line: viewer-side addTransceiver fires negotiationneeded and drives a
-   * polite renegotiation via perfect negotiation (the viewer yields if it
-   * collides with the camera's initial offer).
+   * Task 12 (push-to-talk): the viewer's mic transceiver is added HERE,
+   * synchronously at adopt time — i.e. re-added on EVERY adoption, so a
+   * replaced (reclaimed) camera gets one too. Adding it at adopt time
+   * pre-negotiates the m-line: viewer-side addTransceiver fires
+   * negotiationneeded and drives a polite renegotiation via perfect
+   * negotiation (the viewer yields if it collides with the camera's initial
+   * offer) — pressing PTT later never triggers a renegotiation of its own.
+   *
+   * The already-acquired mic TRACK (if any — i.e. the user pressed PTT at
+   * least once before) is carried across the replacement via replaceTrack,
+   * so a held-and-released press doesn't force a second getUserMedia
+   * prompt. Its ENABLED state is NOT carried, though — resolved decision:
+   * the user may still be physically holding the button when a reclaim/
+   * reconnect swaps in a new peer, but that new connection has not been
+   * armed by an explicit press on IT, and silently continuing to transmit
+   * into a connection the user never (re-)armed is the wrong failure mode.
+   * Forcing disabled + requiring a fresh press is the safer one: a missed
+   * word or two beats an unexpectedly-live mic the user doesn't know about.
    */
   private adoptPeer(remotePeerId: string): void {
     const replacing = this.peer !== null;
@@ -506,6 +633,14 @@ export class ViewerSession {
         this.signaling.send({ type: 'signal', to: remotePeerId, payload }),
     });
     this.peer = peer;
+    this.micTransceiver = peer.addTransceiver('audio', { direction: 'sendonly' });
+    if (this.micTrack !== null) {
+      this.micTrack.enabled = false; // see the "never carry enabled=true" doc above
+      void this.micTransceiver.sender.replaceTrack(this.micTrack).catch(() => {});
+      if (this.state.talk === 'talking' || this.state.talk === 'requesting-mic') {
+        this.setState({ talk: 'idle' });
+      }
+    }
     // Adoption edge (Task 10): fire before the peer's own callbacks are
     // wired below, so a subscriber resetting a watchdog can't race the first
     // connection-state/track event from the peer it's about to reset for.
@@ -538,9 +673,31 @@ export class ViewerSession {
     this.peerUnsubs = [];
     this.peer.close();
     this.peer = null;
+    // The dead peer's transceiver belongs to a dead RTCPeerConnection —
+    // clear the reference so a startTalk() call in the gap before the next
+    // adoptPeer() can't try to replaceTrack onto it (see startTalk's guard).
+    this.micTransceiver = null;
     // Fresh chain for the next peer: its signals must not queue behind
     // whatever the dead peer still had in flight.
     this.chain = Promise.resolve();
+  }
+
+  /**
+   * Release the acquired mic track (if any) — its underlying device LED
+   * must go off. Called only from leave() and the room-closed ('ended')
+   * handler — NOT from closePeer()/adoptPeer() replacements, which
+   * deliberately carry the track across a reclaim/reconnect rather than
+   * re-prompting for permission (see adoptPeer's Task 12 doc).
+   */
+  private releaseMic(): void {
+    if (this.micTrack !== null) {
+      try {
+        this.micTrack.stop();
+      } catch {
+        // Already stopped.
+      }
+    }
+    this.micTrack = null;
   }
 
   // -- state ------------------------------------------------------------------
@@ -548,7 +705,14 @@ export class ViewerSession {
   private fail(message: string): void {
     this.closePeer();
     this.setRemoteStream(null);
-    this.setState({ phase: 'error', error: message, cameraPresent: false });
+    // Task 12: 'error' is a dead end (the UI's only recovery is reload — see
+    // handleErrorReason's docs), and it can be reached mid-press (e.g.
+    // rate-limited while live and talking). closePeer() alone leaves the
+    // acquired MediaStreamTrack running (mic LED on) with nothing left to
+    // release it, since the error screen never renders the PTT button —
+    // release it here too, same as leave()/'ended'.
+    this.releaseMic();
+    this.setState({ phase: 'error', error: message, cameraPresent: false, talk: 'idle' });
   }
 
   private setRemoteStream(stream: MediaStream | null): void {

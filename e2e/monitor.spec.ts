@@ -187,3 +187,75 @@ test('camera death alarms viewer, revival auto-recovers', async ({ browser }) =>
     await teardown(cameraCtx, viewerCtx);
   }
 });
+
+/**
+ * Reads the viewer session's acquired mic track's `enabled` flag through the
+ * same test-hook pattern as framesDecoded above (window.__nannycam, wired in
+ * src/viewer/main.tsx). `micTrack` is a TypeScript-`private` field, but that
+ * is a compile-time-only annotation — at runtime it's an ordinary property,
+ * and reaching into it here is the most direct way to prove the REAL
+ * MediaStreamTrack (not just the session's public talk-state string) flips
+ * with press/release, per this test's explicit brief.
+ */
+async function micEnabled(page: Page): Promise<boolean | null> {
+  return page.evaluate(() => {
+    const win = window as unknown as {
+      __nannycam: { micTrack: MediaStreamTrack | null };
+    };
+    return win.__nannycam.micTrack?.enabled ?? null;
+  });
+}
+
+// Task 12 (talk-back): the viewer pre-negotiates a sendonly mic transceiver
+// at pairing time (see src/viewer/session.ts's adoptPeer) — pressing PTT
+// never renegotiates, it only acquires the mic once and flips track.enabled.
+// This test presses, confirms the camera page actually receives the
+// viewer's mic audio (a real remote-audio element backed by a live
+// MediaStream, not just a UI state flip), then releases and confirms the
+// viewer-side track disables again.
+test('push-to-talk: pressing sends the viewer mic to the camera; track.enabled follows press/release', async ({
+  browser,
+}) => {
+  const { cameraCtx, viewerCtx, cameraPage, viewerPage, consoleErrors } =
+    await pairCameraAndViewer(browser);
+
+  try {
+    const pttBtn = viewerPage.getByTestId('ptt-btn');
+    await expect(pttBtn).toBeVisible();
+    expect(await micEnabled(viewerPage)).toBeNull(); // no press yet: no mic acquired
+
+    // Real press-and-hold via the mouse (synthesizes genuine pointerdown/up
+    // events in Chromium) rather than a synthetic dispatchEvent — see the
+    // Task 12 report for why this was chosen after the alternative proved
+    // less reliable in this fake-media headless setup.
+    await pttBtn.hover();
+    await viewerPage.mouse.down();
+
+    await expect
+      .poll(() => micEnabled(viewerPage), {
+        timeout: 10_000,
+        message: 'viewer mic track never enabled after press',
+      })
+      .toBe(true);
+
+    // The cross-page proof: the camera actually receives the audio (a live
+    // MediaStream backing a rendered remote-audio element), not just that
+    // the viewer's local UI/state flipped.
+    await expect(cameraPage.getByTestId('remote-audio')).toHaveCount(1, {
+      timeout: 10_000,
+    });
+
+    await viewerPage.mouse.up();
+
+    await expect
+      .poll(() => micEnabled(viewerPage), {
+        timeout: 10_000,
+        message: 'viewer mic track never disabled after release',
+      })
+      .toBe(false);
+
+    logConsoleErrors(consoleErrors);
+  } finally {
+    await teardown(cameraCtx, viewerCtx);
+  }
+});
