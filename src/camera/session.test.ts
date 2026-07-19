@@ -1,0 +1,538 @@
+// Tests for CameraSession — mock signaling, mock peers, fake storage, fake
+// media, manual intervals. Fully deterministic; no browser APIs.
+
+import { describe, expect, test } from 'bun:test';
+import type { C2S, S2C } from '../../shared/protocol.ts';
+import type { PeerOptions } from '../lib/peer.ts';
+import {
+  CameraSession,
+  HEARTBEAT_INTERVAL_MS,
+  STORAGE_CODE_KEY,
+  STORAGE_TOKEN_KEY,
+  type CameraState,
+  type PeerLike,
+  type SignalingLike,
+  type VisibilityLike,
+  type WakeLockLike,
+} from './session.ts';
+
+// -- test doubles -----------------------------------------------------------
+
+class MockSignaling implements SignalingLike {
+  sent: C2S[] = [];
+  connectCalls = 0;
+  private messageCbs: Array<(msg: S2C) => void> = [];
+  private reconnectedCbs: Array<() => void> = [];
+
+  connect(): void {
+    this.connectCalls++;
+  }
+  send(msg: C2S): void {
+    this.sent.push(msg);
+  }
+  onMessage(cb: (msg: S2C) => void): () => void {
+    this.messageCbs.push(cb);
+    return () => {};
+  }
+  onReconnected(cb: () => void): () => void {
+    this.reconnectedCbs.push(cb);
+    return () => {};
+  }
+
+  // -- test drivers --
+  receive(msg: S2C): void {
+    for (const cb of [...this.messageCbs]) cb(msg);
+  }
+  reconnect(): void {
+    for (const cb of [...this.reconnectedCbs]) cb();
+  }
+  /** Messages of one C2S type, in send order. */
+  ofType<T extends C2S['type']>(type: T): Array<Extract<C2S, { type: T }>> {
+    return this.sent.filter((m): m is Extract<C2S, { type: T }> => m.type === type);
+  }
+}
+
+class MockPeer implements PeerLike {
+  readonly remotePeerId: string;
+  readonly sendSignal: (payload: unknown) => void;
+  tracks: Array<{ track: MediaStreamTrack; stream: MediaStream }> = [];
+  sentData: string[] = [];
+  closed = false;
+  /** Payloads whose handleSignal call has STARTED (chain-order probe). */
+  started: unknown[] = [];
+  private resolvers: Array<() => void> = [];
+  private dataOpen = false;
+  private openCbs: Array<() => void> = [];
+  private stateCbs: Array<(s: RTCPeerConnectionState) => void> = [];
+
+  constructor(opts: PeerOptions) {
+    this.remotePeerId = opts.remotePeerId;
+    this.sendSignal = opts.sendSignal;
+  }
+
+  addTrack(track: MediaStreamTrack, stream: MediaStream): unknown {
+    this.tracks.push({ track, stream });
+    return undefined;
+  }
+  handleSignal(payload: unknown): Promise<void> {
+    this.started.push(payload);
+    return new Promise((res) => this.resolvers.push(res));
+  }
+  sendData(text: string): boolean {
+    if (!this.dataOpen) return false;
+    this.sentData.push(text);
+    return true;
+  }
+  close(): void {
+    this.closed = true;
+  }
+  get isDataOpen(): boolean {
+    return this.dataOpen;
+  }
+  onDataOpen(cb: () => void): () => void {
+    this.openCbs.push(cb);
+    return () => {};
+  }
+  onConnectionState(cb: (s: RTCPeerConnectionState) => void): () => void {
+    this.stateCbs.push(cb);
+    return () => {};
+  }
+
+  // -- test drivers --
+  openData(): void {
+    this.dataOpen = true;
+    for (const cb of [...this.openCbs]) cb();
+  }
+  finishOneSignal(): void {
+    const res = this.resolvers.shift();
+    if (res === undefined) throw new Error('no in-flight handleSignal');
+    res();
+  }
+  setConnState(s: RTCPeerConnectionState): void {
+    for (const cb of [...this.stateCbs]) cb(s);
+  }
+}
+
+class FakeStorage {
+  private map = new Map<string, string>();
+  getItem(key: string): string | null {
+    return this.map.get(key) ?? null;
+  }
+  setItem(key: string, value: string): void {
+    this.map.set(key, value);
+  }
+  removeItem(key: string): void {
+    this.map.delete(key);
+  }
+}
+
+class ManualIntervals {
+  private nextId = 1;
+  private intervals = new Map<number, { fn: () => void; ms: number }>();
+
+  set = (fn: () => void, ms: number): number => {
+    const id = this.nextId++;
+    this.intervals.set(id, { fn, ms });
+    return id;
+  };
+  clear = (id: number): void => {
+    this.intervals.delete(id);
+  };
+  get count(): number {
+    return this.intervals.size;
+  }
+  delays(): number[] {
+    return [...this.intervals.values()].map((i) => i.ms);
+  }
+  /** Fire every registered interval callback once (one simulated period). */
+  tick(): void {
+    for (const { fn } of [...this.intervals.values()]) fn();
+  }
+}
+
+interface FakeTrack extends MediaStreamTrack {
+  stopped: boolean;
+}
+
+function fakeTrack(kind: 'audio' | 'video'): FakeTrack {
+  const t = {
+    kind,
+    stopped: false,
+    stop() {
+      t.stopped = true;
+    },
+  };
+  return t as unknown as FakeTrack;
+}
+
+function fakeStream(tracks: FakeTrack[]): MediaStream {
+  return { getTracks: () => tracks } as unknown as MediaStream;
+}
+
+function makeHarness(opts: { persisted?: { code: string; token: string } } = {}) {
+  const signaling = new MockSignaling();
+  const storage = new FakeStorage();
+  if (opts.persisted) {
+    storage.setItem(STORAGE_CODE_KEY, opts.persisted.code);
+    storage.setItem(STORAGE_TOKEN_KEY, opts.persisted.token);
+  }
+  const location = { origin: 'https://cam.test', hash: '' };
+  const tracks = [fakeTrack('video'), fakeTrack('audio')];
+  const stream = fakeStream(tracks);
+  const peers: MockPeer[] = [];
+  const intervals = new ManualIntervals();
+  const wakeRequests: string[] = [];
+  const wakeLock: WakeLockLike = {
+    request(type) {
+      wakeRequests.push(type);
+      return Promise.resolve({ release: () => Promise.resolve() });
+    },
+  };
+  let visibilityState = 'visible';
+  const visibilityCbs: Array<() => void> = [];
+  const visibility: VisibilityLike = {
+    get visibilityState() {
+      return visibilityState;
+    },
+    addEventListener(_type, cb) {
+      visibilityCbs.push(cb);
+    },
+  };
+  const states: CameraState[] = [];
+  const session = new CameraSession({
+    signaling,
+    storage,
+    location,
+    getMedia: () => Promise.resolve(stream),
+    createPeer: (o) => {
+      const p = new MockPeer(o);
+      peers.push(p);
+      return p;
+    },
+    setIntervalFn: intervals.set,
+    clearIntervalFn: intervals.clear,
+    wakeLock,
+    visibility,
+  });
+  session.onState((s) => states.push(s));
+  const fireVisibility = (state: string) => {
+    visibilityState = state;
+    for (const cb of [...visibilityCbs]) cb();
+  };
+  const last = () => states[states.length - 1]!;
+  return {
+    session, signaling, storage, location, stream, tracks, peers,
+    intervals, wakeRequests, states, last, fireVisibility,
+  };
+}
+
+const ROOM_CREATED: S2C = {
+  type: 'room-created',
+  code: 'ABCD2345',
+  cameraToken: 'tok-fresh',
+  peerId: 'cam-1',
+};
+
+// -- entry ladder -----------------------------------------------------------
+
+describe('entry ladder', () => {
+  test('no persisted code+token → create-room; room-created → live + persisted', async () => {
+    const h = makeHarness();
+    await h.session.start();
+    expect(h.signaling.connectCalls).toBe(1);
+    expect(h.signaling.sent).toEqual([{ type: 'create-room' }]);
+    expect(h.last().phase).toBe('connecting');
+
+    h.signaling.receive(ROOM_CREATED);
+    expect(h.last()).toMatchObject({
+      phase: 'live',
+      roomCode: 'ABCD2345',
+      viewerUrl: 'https://cam.test/viewer.html#ABCD2345',
+      viewerCount: 0,
+    });
+    expect(h.storage.getItem(STORAGE_CODE_KEY)).toBe('ABCD2345');
+    expect(h.storage.getItem(STORAGE_TOKEN_KEY)).toBe('tok-fresh');
+    expect(h.location.hash).toBe('#ABCD2345');
+  });
+
+  test('persisted code+token → reclaim-room; ack keeps identity', async () => {
+    const h = makeHarness({ persisted: { code: 'ABCD2345', token: 'tok-old' } });
+    await h.session.start();
+    expect(h.signaling.sent).toEqual([
+      { type: 'reclaim-room', code: 'ABCD2345', cameraToken: 'tok-old' },
+    ]);
+    // Reclaim ack is room-created echoing code+token with a NEW peerId.
+    h.signaling.receive({ ...ROOM_CREATED, cameraToken: 'tok-old' });
+    expect(h.last().phase).toBe('live');
+    expect(h.storage.getItem(STORAGE_TOKEN_KEY)).toBe('tok-old');
+  });
+
+  test('reclaim → bad-code → recreate-room with the same code, fresh token stored', async () => {
+    const h = makeHarness({ persisted: { code: 'ABCD2345', token: 'tok-old' } });
+    await h.session.start();
+    h.signaling.receive({ type: 'error', reason: 'bad-code' });
+    expect(h.signaling.sent[1]).toEqual({ type: 'recreate-room', code: 'ABCD2345' });
+
+    h.signaling.receive(ROOM_CREATED); // fresh token in the ack
+    expect(h.last().phase).toBe('live');
+    expect(h.storage.getItem(STORAGE_TOKEN_KEY)).toBe('tok-fresh');
+  });
+
+  test('reclaim → bad-token → token cleared, fall back to create-room', async () => {
+    const h = makeHarness({ persisted: { code: 'ABCD2345', token: 'tok-wrong' } });
+    await h.session.start();
+    h.signaling.receive({ type: 'error', reason: 'bad-token' });
+    expect(h.storage.getItem(STORAGE_TOKEN_KEY)).toBeNull();
+    expect(h.signaling.sent[1]).toEqual({ type: 'create-room' });
+
+    h.signaling.receive({ ...ROOM_CREATED, code: 'FRESH234', cameraToken: 'tok-new' });
+    expect(h.last().roomCode).toBe('FRESH234');
+    expect(h.storage.getItem(STORAGE_CODE_KEY)).toBe('FRESH234');
+    expect(h.storage.getItem(STORAGE_TOKEN_KEY)).toBe('tok-new');
+  });
+
+  test('rate-limited during the ladder → phase error', async () => {
+    const h = makeHarness();
+    await h.session.start();
+    h.signaling.receive({ type: 'error', reason: 'rate-limited' });
+    expect(h.last().phase).toBe('error');
+    expect(h.last().error).toContain('Rate limited');
+  });
+
+  test('error:invalid is ignored (stale-queued-signal noise)', async () => {
+    const h = makeHarness();
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    h.signaling.receive({ type: 'error', reason: 'invalid' });
+    expect(h.last().phase).toBe('live');
+  });
+
+  test('getMedia failure → phase error, no signaling traffic', async () => {
+    const signaling = new MockSignaling();
+    const session = new CameraSession({
+      signaling,
+      storage: new FakeStorage(),
+      location: { origin: 'https://cam.test', hash: '' },
+      getMedia: () => Promise.reject(new Error('NotAllowedError')),
+    });
+    const states: CameraState[] = [];
+    session.onState((s) => states.push(s));
+    await session.start();
+    expect(states[states.length - 1]!.phase).toBe('error');
+    expect(signaling.sent).toEqual([]);
+  });
+});
+
+// -- peers ------------------------------------------------------------------
+
+describe('peers', () => {
+  async function live(opts: Parameters<typeof makeHarness>[0] = {}) {
+    const h = makeHarness(opts);
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    return h;
+  }
+
+  test('peer-joined → Peer created with all local tracks, viewerCount up', async () => {
+    const h = await live();
+    h.signaling.receive({ type: 'peer-joined', peerId: 'viewer-1' });
+    expect(h.peers).toHaveLength(1);
+    const peer = h.peers[0]!;
+    expect(peer.remotePeerId).toBe('viewer-1');
+    expect(peer.tracks.map((t) => t.track)).toEqual(h.tracks);
+    expect(peer.tracks.every((t) => t.stream === h.stream)).toBe(true);
+    expect(h.last().viewerCount).toBe(1);
+  });
+
+  test('outbound signals are wrapped with the viewer peerId', async () => {
+    const h = await live();
+    h.signaling.receive({ type: 'peer-joined', peerId: 'viewer-1' });
+    h.peers[0]!.sendSignal({ kind: 'candidate', candidate: null });
+    expect(h.signaling.ofType('signal')).toEqual([
+      { type: 'signal', to: 'viewer-1', payload: { kind: 'candidate', candidate: null } },
+    ]);
+  });
+
+  test('inbound signals are serial-awaited per peer', async () => {
+    const h = await live();
+    h.signaling.receive({ type: 'peer-joined', peerId: 'viewer-1' });
+    const peer = h.peers[0]!;
+    h.signaling.receive({ type: 'signal', from: 'viewer-1', payload: 'A' });
+    h.signaling.receive({ type: 'signal', from: 'viewer-1', payload: 'B' });
+    await Bun.sleep(0); // flush microtasks
+    // B must NOT start until A's handleSignal resolves (Peer contract).
+    expect(peer.started).toEqual(['A']);
+    peer.finishOneSignal();
+    await Bun.sleep(0);
+    expect(peer.started).toEqual(['A', 'B']);
+  });
+
+  test('signal from an unknown peer is ignored', async () => {
+    const h = await live();
+    h.signaling.receive({ type: 'signal', from: 'stranger', payload: 'x' });
+    expect(h.peers).toHaveLength(0);
+  });
+
+  test('peer-left → peer closed, heartbeat cleared, count down', async () => {
+    const h = await live();
+    h.signaling.receive({ type: 'peer-joined', peerId: 'viewer-1' });
+    h.peers[0]!.openData();
+    expect(h.intervals.count).toBe(1);
+    h.signaling.receive({ type: 'peer-left', peerId: 'viewer-1' });
+    expect(h.peers[0]!.closed).toBe(true);
+    expect(h.intervals.count).toBe(0);
+    expect(h.last().viewerCount).toBe(0);
+  });
+
+  test('duplicate peer-joined (roster replay) rebuilds the peer cleanly', async () => {
+    const h = await live();
+    h.signaling.receive({ type: 'peer-joined', peerId: 'viewer-1' });
+    h.signaling.receive({ type: 'peer-joined', peerId: 'viewer-1' });
+    expect(h.peers).toHaveLength(2);
+    expect(h.peers[0]!.closed).toBe(true);
+    expect(h.peers[1]!.closed).toBe(false);
+    expect(h.last().viewerCount).toBe(1);
+  });
+});
+
+// -- heartbeat ---------------------------------------------------------------
+
+describe('heartbeat', () => {
+  test('starts on data-channel open at 2 s; seq increments per send', async () => {
+    const h = makeHarness();
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    h.signaling.receive({ type: 'peer-joined', peerId: 'viewer-1' });
+    const peer = h.peers[0]!;
+    expect(h.intervals.count).toBe(0); // not before the channel opens
+
+    peer.openData();
+    expect(h.intervals.delays()).toEqual([HEARTBEAT_INTERVAL_MS]);
+    h.intervals.tick();
+    h.intervals.tick();
+    h.intervals.tick();
+    expect(peer.sentData).toEqual([
+      JSON.stringify({ t: 'hb', seq: 0 }),
+      JSON.stringify({ t: 'hb', seq: 1 }),
+      JSON.stringify({ t: 'hb', seq: 2 }),
+    ]);
+  });
+
+  test('per-peer sequences are independent', async () => {
+    const h = makeHarness();
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v1' });
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v2' });
+    h.peers[0]!.openData();
+    h.intervals.tick(); // only v1's heartbeat runs
+    h.peers[1]!.openData();
+    h.intervals.tick(); // both run
+    expect(h.peers[0]!.sentData).toEqual([
+      JSON.stringify({ t: 'hb', seq: 0 }),
+      JSON.stringify({ t: 'hb', seq: 1 }),
+    ]);
+    expect(h.peers[1]!.sentData).toEqual([JSON.stringify({ t: 'hb', seq: 0 })]);
+  });
+});
+
+// -- reconnect (rung 2) ------------------------------------------------------
+
+describe('signaling reconnect', () => {
+  test('rebuilds cleanly: peers closed, ladder re-run, roster replay recreates', async () => {
+    const h = makeHarness();
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    h.signaling.receive({ type: 'peer-joined', peerId: 'viewer-1' });
+    h.peers[0]!.openData();
+
+    h.signaling.reconnect();
+    expect(h.peers[0]!.closed).toBe(true);
+    expect(h.intervals.count).toBe(0);
+    expect(h.last()).toMatchObject({ phase: 'connecting', viewerCount: 0 });
+    // Ladder re-runs with the persisted identity → reclaim.
+    expect(h.signaling.sent[h.signaling.sent.length - 1]).toEqual({
+      type: 'reclaim-room',
+      code: 'ABCD2345',
+      cameraToken: 'tok-fresh',
+    });
+
+    // Server ack (new peerId) + roster replay.
+    h.signaling.receive({ ...ROOM_CREATED, peerId: 'cam-2' });
+    h.signaling.receive({ type: 'peer-joined', peerId: 'viewer-1' });
+    expect(h.last()).toMatchObject({ phase: 'live', viewerCount: 1 });
+    expect(h.peers).toHaveLength(2);
+    expect(h.peers[1]!.closed).toBe(false);
+  });
+
+  test('reconnect while not running is a no-op', () => {
+    const h = makeHarness();
+    h.signaling.reconnect();
+    expect(h.signaling.sent).toEqual([]);
+    expect(h.last().phase).toBe('idle');
+  });
+});
+
+// -- visibility (rung 3) -----------------------------------------------------
+
+describe('visibilitychange → visible', () => {
+  test('re-acquires wake lock; closes only dead peers', async () => {
+    const h = makeHarness();
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v1' });
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v2' });
+    h.peers[0]!.setConnState('failed');
+    h.peers[1]!.setConnState('connected');
+    const wakeBefore = h.wakeRequests.length;
+
+    h.fireVisibility('hidden'); // no sweep while hidden
+    expect(h.peers[0]!.closed).toBe(false);
+
+    h.fireVisibility('visible');
+    expect(h.wakeRequests.length).toBe(wakeBefore + 1);
+    expect(h.peers[0]!.closed).toBe(true); // dead → cleaned up
+    expect(h.peers[1]!.closed).toBe(false); // healthy → untouched
+    expect(h.last().viewerCount).toBe(1);
+  });
+});
+
+// -- stop --------------------------------------------------------------------
+
+describe('stop', () => {
+  test('sends stop-camera, closes peers, clears persistence + fragment + media', async () => {
+    const h = makeHarness();
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    h.signaling.receive({ type: 'peer-joined', peerId: 'viewer-1' });
+    h.peers[0]!.openData();
+
+    h.session.stop();
+    expect(h.signaling.ofType('stop-camera')).toEqual([
+      { type: 'stop-camera', code: 'ABCD2345', cameraToken: 'tok-fresh' },
+    ]);
+    expect(h.peers[0]!.closed).toBe(true);
+    expect(h.intervals.count).toBe(0);
+    expect(h.tracks.every((t) => t.stopped)).toBe(true);
+    expect(h.session.localStream).toBeNull();
+    expect(h.storage.getItem(STORAGE_CODE_KEY)).toBeNull();
+    expect(h.storage.getItem(STORAGE_TOKEN_KEY)).toBeNull();
+    expect(h.location.hash).toBe('');
+    expect(h.last()).toMatchObject({ phase: 'stopped', viewerCount: 0 });
+    expect(h.last().roomCode).toBeUndefined();
+  });
+
+  test('messages after stop are ignored; start again mints a fresh room', async () => {
+    const h = makeHarness();
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    h.session.stop();
+
+    h.signaling.receive({ type: 'peer-joined', peerId: 'ghost' });
+    expect(h.peers).toHaveLength(0);
+    expect(h.last().phase).toBe('stopped');
+
+    await h.session.start();
+    expect(h.signaling.sent[h.signaling.sent.length - 1]).toEqual({ type: 'create-room' });
+  });
+});
