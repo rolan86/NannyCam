@@ -136,6 +136,8 @@ export class CameraSession {
   private running = false;
   private subscribed = false;
   private wakeSentinel: WakeLockSentinelLike | null = null;
+  /** True while a wakeLock.request() is in flight (single-acquire guard). */
+  private wakeAcquiring = false;
 
   constructor(opts: CameraSessionOptions) {
     this.signaling = opts.signaling;
@@ -213,28 +215,18 @@ export class CameraSession {
         cameraToken: this.cameraToken,
       });
     }
+    // Order matters for the wake-lock race guard: running=false BEFORE the
+    // releases, so an in-flight acquireWakeLock() discards its sentinel.
+    this.running = false;
     for (const id of [...this.peers.keys()]) this.removePeer(id);
-    if (this.stream !== null) {
-      for (const track of this.stream.getTracks()) {
-        try {
-          track.stop();
-        } catch {
-          // Already stopped.
-        }
-      }
-      this.stream = null;
-    }
-    if (this.wakeSentinel !== null) {
-      void this.wakeSentinel.release().catch(() => {});
-      this.wakeSentinel = null;
-    }
+    this.releaseMedia();
+    this.releaseWakeLock();
     this.storage.removeItem(STORAGE_CODE_KEY);
     this.storage.removeItem(STORAGE_TOKEN_KEY);
     this.location.hash = '';
     this.roomCode = null;
     this.cameraToken = null;
     this.attempt = null;
-    this.running = false;
     this.setState({
       phase: 'stopped',
       roomCode: undefined,
@@ -361,10 +353,10 @@ export class CameraSession {
       case 'rate-limited': {
         if (this.attempt !== null) {
           this.attempt = null;
-          this.setState({
-            phase: 'error',
-            error: 'Rate limited by the server — wait a moment and retry.',
-          });
+          // Full failure teardown: without it the session would sit in
+          // phase 'error' with running=true (Retry dead), the camera LED on,
+          // and the wake lock held — no escape but a reload.
+          this.failSession('Rate limited by the server — wait a moment and retry.');
         }
         return;
       }
@@ -478,15 +470,67 @@ export class CameraSession {
     }, HEARTBEAT_INTERVAL_MS);
   }
 
+  /**
+   * Failure-path teardown (e.g. rate-limited): release everything a live
+   * session holds — peers, media, wake lock — and stop running so start()
+   * can retry cleanly. Persistence is deliberately KEPT (unlike stop()):
+   * a retry should still reclaim the same room.
+   */
+  private failSession(message: string): void {
+    this.running = false; // before the releases: see the wake-lock race guard
+    for (const id of [...this.peers.keys()]) this.removePeer(id);
+    this.releaseMedia();
+    this.releaseWakeLock();
+    this.setState({ phase: 'error', error: message, viewerCount: 0 });
+  }
+
+  private releaseMedia(): void {
+    if (this.stream === null) return;
+    for (const track of this.stream.getTracks()) {
+      try {
+        track.stop();
+      } catch {
+        // Already stopped.
+      }
+    }
+    this.stream = null;
+  }
+
   // -- wake lock --------------------------------------------------------------
 
   private async acquireWakeLock(): Promise<void> {
-    if (this.wakeLockApi === undefined) return;
+    // Single-acquire guard: repeated visibilitychange events must not pile
+    // up concurrent request() calls (each resolution would orphan a sentinel).
+    if (this.wakeLockApi === undefined || this.wakeAcquiring) return;
+    this.wakeAcquiring = true;
     try {
-      this.wakeSentinel = await this.wakeLockApi.request('screen');
+      const sentinel = await this.wakeLockApi.request('screen');
+      // Race: stop() (or a failure teardown) may have run while request()
+      // was in flight — it released this.wakeSentinel, but THIS sentinel
+      // resolved after. Discard it instead of holding the screen awake on
+      // the stopped screen.
+      if (!this.running) {
+        void sentinel.release().catch(() => {});
+        return;
+      }
+      // Release any previous sentinel before replacing it (re-acquire on a
+      // later visibilitychange while the old one is still held).
+      if (this.wakeSentinel !== null && this.wakeSentinel !== sentinel) {
+        void this.wakeSentinel.release().catch(() => {});
+      }
+      this.wakeSentinel = sentinel;
     } catch {
       // Denied (battery saver, not visible, unsupported): non-fatal — the
       // pre-flight checklist (Task 13) surfaces wake-lock status to the user.
+    } finally {
+      this.wakeAcquiring = false;
+    }
+  }
+
+  private releaseWakeLock(): void {
+    if (this.wakeSentinel !== null) {
+      void this.wakeSentinel.release().catch(() => {});
+      this.wakeSentinel = null;
     }
   }
 

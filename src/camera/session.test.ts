@@ -150,6 +150,37 @@ class ManualIntervals {
   }
 }
 
+class FakeSentinel {
+  released = false;
+  release(): Promise<void> {
+    this.released = true;
+    return Promise.resolve();
+  }
+}
+
+/**
+ * Recording wake lock. In auto mode requests resolve immediately (next
+ * microtask); in manual mode each request stays pending until its recorded
+ * `resolve()` is called — for the acquire-vs-stop race tests.
+ */
+class ManualWakeLock implements WakeLockLike {
+  requests: Array<{ sentinel: FakeSentinel; resolve: () => void }> = [];
+  constructor(private auto: boolean) {}
+  request(_type: 'screen'): Promise<FakeSentinel> {
+    const sentinel = new FakeSentinel();
+    if (this.auto) {
+      this.requests.push({ sentinel, resolve: () => {} });
+      return Promise.resolve(sentinel);
+    }
+    let resolveFn!: (s: FakeSentinel) => void;
+    const promise = new Promise<FakeSentinel>((res) => {
+      resolveFn = res;
+    });
+    this.requests.push({ sentinel, resolve: () => resolveFn(sentinel) });
+    return promise;
+  }
+}
+
 interface FakeTrack extends MediaStreamTrack {
   stopped: boolean;
 }
@@ -169,7 +200,9 @@ function fakeStream(tracks: FakeTrack[]): MediaStream {
   return { getTracks: () => tracks } as unknown as MediaStream;
 }
 
-function makeHarness(opts: { persisted?: { code: string; token: string } } = {}) {
+function makeHarness(
+  opts: { persisted?: { code: string; token: string }; manualWakeLock?: boolean } = {},
+) {
   const signaling = new MockSignaling();
   const storage = new FakeStorage();
   if (opts.persisted) {
@@ -181,13 +214,7 @@ function makeHarness(opts: { persisted?: { code: string; token: string } } = {})
   const stream = fakeStream(tracks);
   const peers: MockPeer[] = [];
   const intervals = new ManualIntervals();
-  const wakeRequests: string[] = [];
-  const wakeLock: WakeLockLike = {
-    request(type) {
-      wakeRequests.push(type);
-      return Promise.resolve({ release: () => Promise.resolve() });
-    },
-  };
+  const wake = new ManualWakeLock(!(opts.manualWakeLock ?? false));
   let visibilityState = 'visible';
   const visibilityCbs: Array<() => void> = [];
   const visibility: VisibilityLike = {
@@ -211,7 +238,7 @@ function makeHarness(opts: { persisted?: { code: string; token: string } } = {})
     },
     setIntervalFn: intervals.set,
     clearIntervalFn: intervals.clear,
-    wakeLock,
+    wakeLock: wake,
     visibility,
   });
   session.onState((s) => states.push(s));
@@ -222,7 +249,7 @@ function makeHarness(opts: { persisted?: { code: string; token: string } } = {})
   const last = () => states[states.length - 1]!;
   return {
     session, signaling, storage, location, stream, tracks, peers,
-    intervals, wakeRequests, states, last, fireVisibility,
+    intervals, wake, states, last, fireVisibility,
   };
 }
 
@@ -304,6 +331,41 @@ describe('entry ladder', () => {
     await h.session.start();
     h.signaling.receive(ROOM_CREATED);
     h.signaling.receive({ type: 'error', reason: 'invalid' });
+    expect(h.last().phase).toBe('live');
+  });
+
+  test('reclaim → bad-code → recreate → bad-code → identity cleared, create-room (final rung)', async () => {
+    const h = makeHarness({ persisted: { code: 'ABCD2345', token: 'tok-old' } });
+    await h.session.start();
+    h.signaling.receive({ type: 'error', reason: 'bad-code' }); // reclaim refused
+    h.signaling.receive({ type: 'error', reason: 'bad-code' }); // recreate refused
+    expect(h.storage.getItem(STORAGE_CODE_KEY)).toBeNull();
+    expect(h.storage.getItem(STORAGE_TOKEN_KEY)).toBeNull();
+    expect(h.signaling.sent).toEqual([
+      { type: 'reclaim-room', code: 'ABCD2345', cameraToken: 'tok-old' },
+      { type: 'recreate-room', code: 'ABCD2345' },
+      { type: 'create-room' },
+    ]);
+    h.signaling.receive({ ...ROOM_CREATED, code: 'FRESH234' });
+    expect(h.last()).toMatchObject({ phase: 'live', roomCode: 'FRESH234' });
+  });
+
+  test('rate-limited tears down fully and Retry works', async () => {
+    const h = makeHarness();
+    await h.session.start();
+    await Bun.sleep(0); // wake acquisition settles
+    h.signaling.receive({ type: 'error', reason: 'rate-limited' });
+    expect(h.last().phase).toBe('error');
+    // Nothing left hot: camera released, wake lock released.
+    expect(h.tracks.every((t) => t.stopped)).toBe(true);
+    expect(h.session.localStream).toBeNull();
+    expect(h.wake.requests[0]!.sentinel.released).toBe(true);
+
+    // Retry: start() must run again, not bounce off a stale running flag.
+    await h.session.start();
+    expect(h.last().phase).toBe('connecting');
+    expect(h.signaling.ofType('create-room')).toHaveLength(2);
+    h.signaling.receive(ROOM_CREATED);
     expect(h.last().phase).toBe('live');
   });
 
@@ -484,16 +546,65 @@ describe('visibilitychange → visible', () => {
     h.signaling.receive({ type: 'peer-joined', peerId: 'v2' });
     h.peers[0]!.setConnState('failed');
     h.peers[1]!.setConnState('connected');
-    const wakeBefore = h.wakeRequests.length;
+    await Bun.sleep(0); // let start()'s wake acquisition settle
+    const wakeBefore = h.wake.requests.length;
 
     h.fireVisibility('hidden'); // no sweep while hidden
     expect(h.peers[0]!.closed).toBe(false);
 
     h.fireVisibility('visible');
-    expect(h.wakeRequests.length).toBe(wakeBefore + 1);
+    expect(h.wake.requests.length).toBe(wakeBefore + 1);
     expect(h.peers[0]!.closed).toBe(true); // dead → cleaned up
     expect(h.peers[1]!.closed).toBe(false); // healthy → untouched
     expect(h.last().viewerCount).toBe(1);
+  });
+});
+
+// -- wake lock ---------------------------------------------------------------
+
+describe('wake lock', () => {
+  test('stop() releases the held sentinel', async () => {
+    const h = makeHarness();
+    await h.session.start();
+    await Bun.sleep(0); // acquisition settles
+    h.signaling.receive(ROOM_CREATED);
+    expect(h.wake.requests).toHaveLength(1);
+    expect(h.wake.requests[0]!.sentinel.released).toBe(false);
+
+    h.session.stop();
+    expect(h.wake.requests[0]!.sentinel.released).toBe(true);
+  });
+
+  test('request resolving AFTER stop() is released, not re-held', async () => {
+    const h = makeHarness({ manualWakeLock: true });
+    await h.session.start(); // request now in flight, unresolved
+    h.signaling.receive(ROOM_CREATED);
+    h.session.stop(); // nothing held yet — nothing to release
+
+    h.wake.requests[0]!.resolve(); // the race: resolution lands post-stop
+    await Bun.sleep(0);
+    expect(h.wake.requests[0]!.sentinel.released).toBe(true);
+  });
+
+  test('single acquire in flight; re-acquire on visible releases the old sentinel', async () => {
+    const h = makeHarness({ manualWakeLock: true });
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    expect(h.wake.requests).toHaveLength(1);
+
+    // While the first request is still pending, visible events must not
+    // stack a second request.
+    h.fireVisibility('visible');
+    expect(h.wake.requests).toHaveLength(1);
+
+    h.wake.requests[0]!.resolve();
+    await Bun.sleep(0);
+    h.fireVisibility('visible'); // genuine re-acquire
+    expect(h.wake.requests).toHaveLength(2);
+    h.wake.requests[1]!.resolve();
+    await Bun.sleep(0);
+    expect(h.wake.requests[0]!.sentinel.released).toBe(true); // old: released
+    expect(h.wake.requests[1]!.sentinel.released).toBe(false); // new: held
   });
 });
 

@@ -1,0 +1,16 @@
+/* NannyCam camera page styles. Kept in a real stylesheet (imported from
+   main.tsx, emitted as an external CSS asset by Vite) — Task 14's strict CSP
+   (style-src via default-src 'self') would block an inline <style> block. */
+
+* { box-sizing: border-box; margin: 0; }
+body { font-family: system-ui, sans-serif; background: #111; color: #eee; }
+main { display: flex; flex-direction: column; align-items: center; gap: 1rem; padding: 1rem; min-height: 100vh; }
+main.center { justify-content: center; }
+.preview { width: 100%; max-width: 480px; border-radius: 8px; background: #000; }
+.code { font-family: ui-monospace, monospace; font-size: 2.5rem; letter-spacing: 0.3em; font-weight: 700; }
+.qr { background: #fff; padding: 8px; border-radius: 8px; }
+.status { color: #aaa; }
+.error { color: #f66; }
+button { font-size: 1.25rem; padding: 0.9rem 2.2rem; border: none; border-radius: 8px; cursor: pointer; }
+button.primary { background: #2b7; color: #fff; }
+button.danger { background: #d33; color: #fff; }

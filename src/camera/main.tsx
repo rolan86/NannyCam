@@ -7,6 +7,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { toCanvas } from 'qrcode';
 import { SignalingClient } from '../lib/signaling.ts';
 import { CameraSession, type CameraState } from './session.ts';
+import './camera.css';
 
 const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
 
