@@ -1,0 +1,48 @@
+ want to build a nanny cam that works between any 2 phones having a camera. No iPhone app, no android app. Secure, on simple web app, no recording of data, no leakage of data or footage. Can this be done? If yes, how?Do not codeContemplated peer-to-peer architecture for secure cross-platform video streamingContemplated peer-to-peer architecture for secure cross-platform video streamingYes, this is very doable, and the architecture is elegantly simple: WebRTC peer-to-peer video in the browser.
+How it works
+
+Both phones open a web page (your simple web app). No app install — modern mobile browsers (Chrome, Safari) fully support camera access via getUserMedia and WebRTC.
+One phone is the "camera" (pointed at the crib), the other is the "viewer". The camera phone streams its video/audio directly to the viewer phone over an encrypted peer-to-peer connection.
+A tiny signaling server is needed only for the handshake — the two phones exchange connection metadata (SDP offers/answers, ICE candidates) through it. Once connected, video flows directly phone-to-phone, never through your server. The signaling server sees no footage, ever.
+Pairing can be a random room code or QR code: camera phone generates a code, viewer enters/scans it, connection established.
+
+Why it satisfies your constraints
+
+Secure: WebRTC mandates DTLS-SRTP encryption — all media is end-to-end encrypted by protocol design. Serve the page over HTTPS (also required for camera access anyway).
+No recording: Nothing is stored. The stream exists only in transit; neither server nor browser persists anything unless you build that in.
+No leakage: Media is P2P. The only caveat: if the two phones are behind restrictive NATs (e.g., camera on home Wi-Fi, viewer on carrier CGNAT), you may need a TURN relay server. TURN relays encrypted packets it cannot decrypt — but if you want zero third-party transit, self-host coturn on a small VPS (a Hetzner box, right up your alley), or accept that same-network use (both phones on home Wi-Fi) needs no relay at all.
+
+Practical additions worth considering
+
+Wake lock API so the camera phone's screen doesn't sleep and kill the stream
+A short random room token with expiry, so stale links can't reconnect
+Optional motion/noise detection done client-side (canvas frame diffing / Web Audio levels) — still no data leaves the pair
+
+The whole thing is roughly: static HTML/JS page + ~50 lines of signaling (WebSocket) + optionally coturn. Services like this exist (e.g., open-source "webrtc video call" demos), but self-hosting gives you the no-leakage guarantee you actually want to verify rather than trust.
+Want me to sketch the trust model in more detail — i.e., exactly what an attacker at each point (server operator, ISP, someone with the link) could and couldn't see?What about using my Mac as the server within the home WiFi?Identified HTTPS constraints and weighed local network solutionsIdentified HTTPS constraints and weighed local network solutionsThat's actually the ideal setup for your threat model — everything stays inside your LAN, nothing touches the internet at all.
+What the Mac does
+
+Serves the web page — a static HTML/JS file over your home Wi-Fi (e.g., https://192.168.x.x:8443).
+Runs the signaling handshake — a tiny WebSocket relay for the SDP/ICE exchange.
+Then gets out of the way — the video flows phone-to-phone directly over Wi-Fi. On the same subnet, WebRTC connects via host candidates: no STUN, no TURN, no external servers whatsoever.
+
+The one real hurdle: HTTPS
+Browsers only allow camera access on secure origins. localhost is exempt, but your phones will be hitting the Mac's LAN IP, which isn't. Your options:
+
+mkcert (cleanest): generates a locally-trusted certificate authority; you install the root cert on both phones once, then https://mac.local works with a green lock. Fully offline.
+Self-signed cert: works, but each phone shows a scary warning you must click through — and iOS Safari is stubborn about this with WebSockets, so mkcert is worth the extra five minutes.
+A real domain pointed at a LAN IP with a Let's Encrypt cert (DNS challenge) — elegant but overkill for this.
+
+Security picture with this setup
+
+Zero external parties. No VPS, no relay, no third-party signaling. An outside attacker would need to be on your Wi-Fi to even see the page exists.
+Media still DTLS-SRTP encrypted even on the LAN, so another device on your Wi-Fi can't sniff the stream.
+Add a room code anyway, so a guest on your Wi-Fi can't casually open the viewer page.
+
+Caveats worth knowing
+
+The Mac must stay awake (caffeinate or Energy Saver settings) — though it's only critical during connection setup; an established stream survives the Mac sleeping, but reconnects won't.
+Check that your router doesn't have "AP/client isolation" enabled, which blocks phone-to-phone traffic on some setups (common on guest networks).
+Range is limited to your Wi-Fi. If you later want to check in from outside the house, Tailscale — which you already run — would extend this beautifully: phones join your tailnet, and the same architecture works from anywhere, still with no public exposure.
+
+This is honestly the best-case version of the project: your Dell home server could eventually take over the Mac's role as the always-on host, and it fits neatly into the sandbox stack you've already planned.
