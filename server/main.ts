@@ -98,6 +98,18 @@ export function startServer(opts: StartOptions): RelayHandle {
     cameraByRoom.set(code, ws.data.peerId);
   }
 
+  /**
+   * Replay the room's current viewer roster to a (re)binding camera socket
+   * as one peer-joined per viewer. A camera reconnecting on a fresh socket
+   * otherwise knows no viewer peerIds (and viewers don't know its new one),
+   * so reconnection-ladder rung 3 could never re-offer.
+   */
+  function replayRoster(ws: Socket, code: string): void {
+    for (const viewerId of rooms.viewers(code)) {
+      send(ws, { type: 'peer-joined', peerId: viewerId });
+    }
+  }
+
   // -- inbound message handling ---------------------------------------------
 
   function handleMessage(ws: Socket, msg: C2S): void {
@@ -124,7 +136,9 @@ export function startServer(opts: StartOptions): RelayHandle {
           peerId: ws.data.peerId,
         });
         // Recreation only succeeds when no room with this code exists, so the
-        // viewer set is empty today; kept for symmetry with reclaim.
+        // roster replay and viewer broadcast are no-ops today; kept for
+        // symmetry with reclaim.
+        replayRoster(ws, msg.code);
         return broadcastToViewers(msg.code, { type: 'camera-back' });
       }
 
@@ -158,6 +172,10 @@ export function startServer(opts: StartOptions): RelayHandle {
           cameraToken: msg.cameraToken,
           peerId: ws.data.peerId,
         });
+        // Replay the current viewer roster to the reclaiming socket: without
+        // it, neither side knows the other's peerId after a camera reconnect
+        // and reconnection-ladder rung 3 (rebuild + re-offer) would deadlock.
+        replayRoster(ws, msg.code);
         return broadcastToViewers(msg.code, { type: 'camera-back' });
       }
 

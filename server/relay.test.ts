@@ -308,7 +308,7 @@ describe('camera disconnect and reclaim', () => {
   test('reclaim → camera re-bound (room-created ack), viewers get camera-back', async () => {
     const h = boot();
     const { cam, code, token, camId } = await createRoom(h.port);
-    const { viewer } = await joinRoom(h.port, code);
+    const { viewer, viewerId: existingViewerId } = await joinRoom(h.port, code);
     await cam.next(); // peer-joined
     cam.ws.close();
     await viewer.next(); // peer-left
@@ -321,10 +321,63 @@ describe('camera disconnect and reclaim', () => {
     expect(ack.code).toBe(code);
     expect(ack.cameraToken).toBe(token);
     expect(ack.peerId).not.toBe(camId);
+    // Roster replay: the pre-existing viewer is announced to the new socket.
+    expect(await cam2.next()).toEqual({ type: 'peer-joined', peerId: existingViewerId });
     expect(await viewer.next()).toEqual({ type: 'camera-back' });
     // New camera socket is bound: it gets peer-joined for the next viewer.
     const { viewerId } = await joinRoom(h.port, code);
     expect(await cam2.next()).toEqual({ type: 'peer-joined', peerId: viewerId });
+  });
+
+  test('reclaim replays one peer-joined per pre-existing viewer', async () => {
+    const h = boot();
+    const { cam, code, token } = await createRoom(h.port);
+    const a = await joinRoom(h.port, code);
+    await cam.next(); // peer-joined a
+    const b = await joinRoom(h.port, code);
+    await cam.next(); // peer-joined b
+    cam.ws.close();
+    await a.viewer.next(); // peer-left
+    await b.viewer.next(); // peer-left
+
+    const cam2 = await connect(h.port);
+    cam2.send({ type: 'reclaim-room', code, cameraToken: token });
+    expect((await cam2.next()).type).toBe('room-created');
+    // Exactly one peer-joined per current viewer, in join order.
+    expect(await cam2.next()).toEqual({ type: 'peer-joined', peerId: a.viewerId });
+    expect(await cam2.next()).toEqual({ type: 'peer-joined', peerId: b.viewerId });
+    await cam2.expectSilence();
+    expect(await a.viewer.next()).toEqual({ type: 'camera-back' });
+    expect(await b.viewer.next()).toEqual({ type: 'camera-back' });
+  });
+
+  test('signal round-trip after reclaim using only replayed/relayed peerIds', async () => {
+    const h = boot();
+    const { cam, code, token } = await createRoom(h.port);
+    const { viewer } = await joinRoom(h.port, code);
+    await cam.next(); // peer-joined
+    cam.ws.close();
+    await viewer.next(); // peer-left
+
+    const cam2 = await connect(h.port);
+    cam2.send({ type: 'reclaim-room', code, cameraToken: token });
+    await cam2.next(); // room-created ack
+    const replayed = await cam2.next();
+    expect(replayed.type).toBe('peer-joined');
+    if (replayed.type !== 'peer-joined') return;
+    await viewer.next(); // camera-back
+
+    // Camera re-offers using ONLY the replayed viewer peerId...
+    cam2.send({ type: 'signal', to: replayed.peerId, payload: { sdp: 'offer' } });
+    const offer = await viewer.next();
+    expect(offer.type).toBe('signal');
+    if (offer.type !== 'signal') return;
+    expect(offer.payload).toEqual({ sdp: 'offer' });
+    // ...and the viewer answers using ONLY the relayed `from` field — rung 3
+    // is wireable with zero viewer-side prior knowledge of the new camera id.
+    viewer.send({ type: 'signal', to: offer.from, payload: { sdp: 'answer' } });
+    const answer = await cam2.next();
+    expect(answer).toEqual({ type: 'signal', from: replayed.peerId, payload: { sdp: 'answer' } });
   });
 
   test('reclaim with wrong token → error bad-token', async () => {
@@ -339,13 +392,14 @@ describe('camera disconnect and reclaim', () => {
   test('reclaim while stale camera socket still attached → stale closed, no peer-left', async () => {
     const h = boot();
     const { cam, code, token } = await createRoom(h.port);
-    const { viewer } = await joinRoom(h.port, code);
+    const { viewer, viewerId: existingViewerId } = await joinRoom(h.port, code);
     await cam.next(); // peer-joined
 
     const cam2 = await connect(h.port);
     cam2.send({ type: 'reclaim-room', code, cameraToken: token });
     const ack = await cam2.next();
     expect(ack.type).toBe('room-created');
+    expect(await cam2.next()).toEqual({ type: 'peer-joined', peerId: existingViewerId });
     expect(await viewer.next()).toEqual({ type: 'camera-back' });
     // The stale camera socket is closed by the server...
     await cam.closed();
