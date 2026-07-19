@@ -56,9 +56,12 @@ class MockPeer implements PeerLike {
   closed = false;
   /** Payloads whose handleSignal call has STARTED (chain-order probe). */
   started: unknown[] = [];
+  /** Token report returned by getStats (identity-checked in tests). */
+  statsResult = { peer: this } as unknown as RTCStatsReport;
   private resolvers: Array<() => void> = [];
   private trackCbs: Array<(ev: TrackEventLike) => void> = [];
   private dataCbs: Array<(text: string) => void> = [];
+  private connCbs: Array<(s: RTCPeerConnectionState) => void> = [];
 
   constructor(opts: PeerOptions) {
     this.remotePeerId = opts.remotePeerId;
@@ -84,10 +87,25 @@ class MockPeer implements PeerLike {
       this.dataCbs = this.dataCbs.filter((f) => f !== cb);
     };
   }
+  onConnectionState(cb: (s: RTCPeerConnectionState) => void): () => void {
+    this.connCbs.push(cb);
+    return () => {
+      this.connCbs = this.connCbs.filter((f) => f !== cb);
+    };
+  }
+  getStats(): Promise<RTCStatsReport> {
+    return Promise.resolve(this.statsResult);
+  }
 
   // -- test drivers --
   emitTrack(stream: MediaStream): void {
     for (const cb of [...this.trackCbs]) cb({ streams: [stream] });
+  }
+  emitBareTrack(): void {
+    for (const cb of [...this.trackCbs]) cb({ streams: [] });
+  }
+  setConnState(s: RTCPeerConnectionState): void {
+    for (const cb of [...this.connCbs]) cb(s);
   }
   emitData(text: string): void {
     for (const cb of [...this.dataCbs]) cb(text);
@@ -308,6 +326,45 @@ describe('camera peer', () => {
     h.peers[0]!.emitData('{"t":"hb","seq":0}');
     expect(h.dataMessages).toEqual(['{"t":"hb","seq":0}']);
   });
+
+  test('a track event without streams is ignored (no phantom live)', () => {
+    const h = joined();
+    h.signaling.receive({ type: 'signal', from: 'cam-1', payload: 'offer' });
+    h.peers[0]!.emitBareTrack();
+    expect(h.last().phase).toBe('waiting-camera');
+    expect(h.lastStream()).toBeNull();
+  });
+});
+
+// -- Task 10 consumer surface -----------------------------------------------
+
+describe('connection state + stats (Task 10 surface)', () => {
+  test('onConnectionState follows the current peer and survives replacement', () => {
+    const h = live();
+    const seen: RTCPeerConnectionState[] = [];
+    h.session.onConnectionState((s) => seen.push(s));
+    h.peers[0]!.setConnState('connected');
+
+    // Replacement: the reclaimed camera's peer feeds the SAME subscription.
+    h.signaling.receive({ type: 'signal', from: 'cam-2', payload: 'offer' });
+    h.peers[1]!.setConnState('connecting');
+    // The dead peer's late emissions no longer reach subscribers.
+    h.peers[0]!.setConnState('failed');
+    expect(seen).toEqual(['connected', 'connecting']);
+  });
+
+  test('getStats resolves null without a peer and delegates to the current one', async () => {
+    const h = joined();
+    expect(await h.session.getStats()).toBeNull();
+    h.signaling.receive({ type: 'signal', from: 'cam-1', payload: 'offer' });
+    expect(await h.session.getStats()).toBe(h.peers[0]!.statsResult);
+
+    h.signaling.receive({ type: 'signal', from: 'cam-2', payload: 'offer' });
+    expect(await h.session.getStats()).toBe(h.peers[1]!.statsResult);
+
+    h.session.leave();
+    expect(await h.session.getStats()).toBeNull();
+  });
 });
 
 // -- camera lifecycle -------------------------------------------------------
@@ -349,6 +406,14 @@ describe('camera lifecycle', () => {
     expect(h.last()).toMatchObject({ phase: 'ended', cameraPresent: false });
   });
 
+  test('room-joined outside joining (hostile relay) resets peer + stream first', () => {
+    const h = live();
+    h.signaling.receive(ROOM_JOINED);
+    expect(h.peers[0]!.closed).toBe(true);
+    expect(h.lastStream()).toBeNull();
+    expect(h.last()).toMatchObject({ phase: 'waiting-camera', cameraPresent: true });
+  });
+
   test('messages after ended are ignored', () => {
     const h = live();
     h.signaling.receive({ type: 'room-closed' });
@@ -385,10 +450,22 @@ describe('errors', () => {
     expect(h.last().error).toContain('Rate limited');
   });
 
-  test('error:invalid is ignored (stale-queued-signal noise)', () => {
+  test('error:invalid is ignored while in the room (stale-queued-signal noise)', () => {
     const h = live();
     h.signaling.receive({ type: 'error', reason: 'invalid' });
     expect(h.last().phase).toBe('live');
+  });
+
+  test('leave→join wedge: error:invalid during a user join fails clearly (no forever-joining)', () => {
+    const h = live();
+    h.session.leave();
+    // The relay still has this socket bound to the old room, so the re-join
+    // is refused with error:invalid.
+    h.session.join('ABCD2345');
+    expect(h.last().phase).toBe('joining');
+    h.signaling.receive({ type: 'error', reason: 'invalid' });
+    expect(h.last().phase).toBe('error');
+    expect(h.last().error).toContain('reload');
   });
 
   test('join again after error works', () => {
@@ -422,6 +499,20 @@ describe('signaling reconnect', () => {
     h.peers[1]!.emitTrack(s2);
     expect(h.last()).toMatchObject({ phase: 'live', cameraPresent: true });
     expect(h.lastStream()).toBe(s2);
+  });
+
+  test('error:invalid during a rung-2 re-join is stale-flush noise, not a failure', () => {
+    const h = live();
+    h.signaling.reconnect();
+    expect(h.last().phase).toBe('joining');
+    // Stale signals queued during the outage flushed BEFORE our join-room;
+    // the relay answers each with error:invalid. Must not fail the re-join —
+    // the fresh socket's join-room cannot itself be refused as invalid.
+    h.signaling.receive({ type: 'error', reason: 'invalid' });
+    h.signaling.receive({ type: 'error', reason: 'invalid' });
+    expect(h.last().phase).toBe('joining');
+    h.signaling.receive(ROOM_JOINED);
+    expect(h.last()).toMatchObject({ phase: 'waiting-camera', cameraPresent: true });
   });
 
   test('no re-join when never joined, after ended, or after leave', () => {
@@ -504,5 +595,36 @@ describe('leave', () => {
     h.signaling.receive({ type: 'camera-back' });
     expect(h.peers).toHaveLength(1);
     expect(h.last().phase).toBe('idle');
+  });
+});
+
+// -- subscriptions ----------------------------------------------------------
+
+describe('unsubscribe closures', () => {
+  test('onState / onRemoteStream / onDataMessage / onConnectionState stop delivering', () => {
+    const h = joined();
+    const states: ViewerState[] = [];
+    const streams: Array<MediaStream | null> = [];
+    const data: string[] = [];
+    const conns: RTCPeerConnectionState[] = [];
+    const unsubState = h.session.onState((s) => states.push(s));
+    const unsubStream = h.session.onRemoteStream((s) => streams.push(s));
+    const unsubData = h.session.onDataMessage((t) => data.push(t));
+    const unsubConn = h.session.onConnectionState((s) => conns.push(s));
+    const baseline = { states: states.length, streams: streams.length };
+
+    unsubState();
+    unsubStream();
+    unsubData();
+    unsubConn();
+
+    h.signaling.receive({ type: 'signal', from: 'cam-1', payload: 'offer' });
+    h.peers[0]!.emitTrack(fakeStream('s1'));
+    h.peers[0]!.emitData('hb');
+    h.peers[0]!.setConnState('connected');
+    expect(states.length).toBe(baseline.states);
+    expect(streams.length).toBe(baseline.streams);
+    expect(data).toEqual([]);
+    expect(conns).toEqual([]);
   });
 });

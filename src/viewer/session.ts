@@ -62,6 +62,8 @@ export interface PeerLike {
   close(): void;
   onTrack(cb: (ev: TrackEventLike) => void): () => void;
   onDataMessage(cb: (text: string) => void): () => void;
+  onConnectionState(cb: (s: RTCPeerConnectionState) => void): () => void;
+  getStats(): Promise<RTCStatsReport>;
 }
 
 /**
@@ -107,6 +109,7 @@ export class ViewerSession {
   private stateCbs: Array<(s: ViewerState) => void> = [];
   private streamCbs: Array<(stream: MediaStream | null) => void> = [];
   private dataCbs: Array<(text: string) => void> = [];
+  private connStateCbs: Array<(s: RTCPeerConnectionState) => void> = [];
 
   /** The single camera Peer (see the file-header discovery note). */
   private peer: PeerLike | null = null;
@@ -122,6 +125,12 @@ export class ViewerSession {
   private remoteStream: MediaStream | null = null;
   /** The code we are (re)joining with; null until join(), cleared by leave(). */
   private activeCode: string | null = null;
+  /**
+   * True while the current 'joining' phase is a rung-2 re-join (fresh socket
+   * after a signaling reconnect) rather than a user-initiated join(). Gates
+   * the error:invalid handling — see handleErrorReason.
+   */
+  private rejoining = false;
   private subscribed = false;
   private audioCtx: AudioContextLike | null = null;
 
@@ -180,10 +189,43 @@ export class ViewerSession {
   }
 
   /**
+   * RTCPeerConnection state of the CURRENT camera Peer. The subscription is
+   * session-level: it transparently survives peer replacement (each adopted
+   * peer is re-wired to this stream), so Task 10's watchdog subscribes once
+   * and keeps receiving states across camera reclaims/reconnects. Returns an
+   * unsubscribe closure.
+   */
+  onConnectionState(cb: (s: RTCPeerConnectionState) => void): () => void {
+    this.connStateCbs.push(cb);
+    return () => {
+      this.connStateCbs = this.connStateCbs.filter((f) => f !== cb);
+    };
+  }
+
+  /**
+   * Stats snapshot of the CURRENT camera Peer (Task 10's framesDecoded
+   * watchdog polls this). Resolves null when no peer exists (not joined, or
+   * waiting for the camera's first offer) — callers treat null as "nothing
+   * to measure", not an error. Delegation follows peer replacement
+   * automatically.
+   */
+  getStats(): Promise<RTCStatsReport | null> {
+    if (this.peer === null) return Promise.resolve(null);
+    return this.peer.getStats();
+  }
+
+  /**
    * Join a room. The code comes from the argument (input field) or, when
    * absent, from the URL fragment (#CODE); both are uppercase-normalized.
    * Invalid/absent code → stays 'idle' with an error hint so the UI shows
    * the input screen. No-op while already joining/joined.
+   *
+   * Socket-binding hazard: the relay binds a socket to ONE room, ever, and
+   * only unbinds it on room-closed or socket close — leave() is local (see
+   * its doc). A join() on a socket the relay still considers bound is
+   * answered with error:invalid, which handleErrorReason surfaces as a join
+   * failure (reload to fix). The one legitimate live-socket re-join is the
+   * signaling-reconnect path (rung 2), which runs on a FRESH, unbound socket.
    */
   join(code?: string): void {
     const phase = this.state.phase;
@@ -197,6 +239,7 @@ export class ViewerSession {
       return;
     }
     this.activeCode = normalized;
+    this.rejoining = false;
     this.ensureSubscribed();
     this.signaling.connect();
     this.setState({
@@ -229,9 +272,10 @@ export class ViewerSession {
    * protocol has no leave message — the relay only removes a viewer when its
    * socket closes, so closing the page is the REAL leave. The signaling
    * client is shared/owned by the caller and stays untouched; note that the
-   * relay still counts this socket as a room member, so joining a DIFFERENT
-   * room afterwards needs a page reload (the relay binds one room per
-   * socket, ever).
+   * relay still counts this socket as a room member, so a join() afterwards
+   * (same room or different) is refused with error:invalid until the socket
+   * rebinds — the UI surfaces that as a join failure telling the user to
+   * reload (see join()'s socket-binding hazard note).
    */
   leave(): void {
     this.closePeer();
@@ -267,6 +311,15 @@ export class ViewerSession {
           // In the room. cameraPresent=false still shows the waiting screen,
           // labeled "camera offline" by the UI; the camera's arrival later
           // announces itself via camera-back (reclaim) or its first offer.
+          //
+          // Defensive gate: a room-joined OUTSIDE 'joining' never happens
+          // with the real relay (it acks join-room exactly once), so treat
+          // it as a reset — drop any live Peer/stream before re-entering
+          // the waiting state rather than leaving them orphaned.
+          if (phase !== 'joining') {
+            this.closePeer();
+            this.setRemoteStream(null);
+          }
           this.setState({
             phase: 'waiting-camera',
             cameraPresent: msg.cameraPresent,
@@ -350,11 +403,26 @@ export class ViewerSession {
         this.fail('Rate limited by the server — wait a moment and retry.');
         return;
       case 'invalid':
+        // During a USER-initiated join, error:invalid can only be the relay
+        // refusing OUR join-room — the socket sent nothing else in that
+        // phase — which means it is still bound to a previous room (join()
+        // after leave(); see the socket-binding hazard on join()).
+        // Surfacing it beats the alternative: swallowing it wedges the
+        // session in 'joining' forever.
+        //
+        // NOT during a rung-2 re-join, though: stale signals queued during
+        // the outage flush BEFORE our join-room (SignalingClient contract)
+        // and each draws error:invalid — arriving while we are 'joining'.
+        // On the reconnect's fresh, unbound socket the join-room itself can
+        // never be refused as invalid, so those are noise and failing here
+        // would wedge the recovery instead. Outside 'joining' invalid is
+        // always that same stale-signal noise.
+        if (this.state.phase === 'joining' && !this.rejoining) {
+          this.fail('Could not join on this connection — reload the page and try again.');
+        }
+        return;
       case 'bad-token':
-        // 'invalid' is expected noise: stale signals queued during an outage
-        // flush before our re-join rebinds the socket, and the relay answers
-        // each with error:invalid (see SignalingClient.send docs).
-        // 'bad-token' is camera-directed and can't apply to a viewer.
+        // Camera-directed; can't apply to a viewer.
         return;
       default: {
         const _exhaustive: never = reason;
@@ -370,6 +438,13 @@ export class ViewerSession {
    * peer-on-first-signal adopts (the old camera Peer is closed here first —
    * its transport rode the previous pairing). Skipped after 'ended' (the
    * room is gone; the user re-joins explicitly) and when never joined.
+   *
+   * Server-restart race: when the relay itself restarted, our re-join races
+   * the camera's recreate-room and can draw bad-code a few seconds before
+   * the camera re-registers the code — landing us on the error screen even
+   * though the room is about to exist again. Task 10 owns the retry policy
+   * for that window; until then the error screen's Join button (same code
+   * pre-filled) is the one-tap recovery.
    */
   private handleReconnected(): void {
     if (this.activeCode === null) return;
@@ -377,13 +452,24 @@ export class ViewerSession {
     if (phase === 'idle' || phase === 'ended') return;
     this.closePeer();
     this.setRemoteStream(null);
+    this.rejoining = true;
     this.setState({ phase: 'joining', cameraPresent: false, error: undefined });
     this.signaling.send({ type: 'join-room', code: this.activeCode });
   }
 
   // -- peer -------------------------------------------------------------------
 
-  /** Create the camera Peer, replacing (closing) any prior one. */
+  /**
+   * Create the camera Peer, replacing (closing) any prior one.
+   *
+   * Task 12 (push-to-talk) note: the viewer's mic transceiver must be added
+   * HERE, synchronously at adopt time — i.e. re-added on EVERY adoption, so
+   * a replaced (reclaimed) camera gets it too, with the PTT enabled-state
+   * carried across replacements. Adding it at adopt time pre-negotiates the
+   * m-line: viewer-side addTransceiver fires negotiationneeded and drives a
+   * polite renegotiation via perfect negotiation (the viewer yields if it
+   * collides with the camera's initial offer).
+   */
   private adoptPeer(remotePeerId: string): void {
     const replacing = this.peer !== null;
     this.closePeer();
@@ -412,6 +498,13 @@ export class ViewerSession {
     this.peerUnsubs.push(
       peer.onDataMessage((text) => {
         for (const cb of [...this.dataCbs]) cb(text);
+      }),
+    );
+    // Session-level connection-state stream (Task 10): re-wired on every
+    // adoption so subscribers transparently follow peer replacement.
+    this.peerUnsubs.push(
+      peer.onConnectionState((s) => {
+        for (const cb of [...this.connStateCbs]) cb(s);
       }),
     );
   }
