@@ -58,13 +58,17 @@ export class SignalingClient {
 
   /** The live socket. Events from any other (stale) socket are ignored. */
   private socket: WebSocketLike | null = null;
-  private status: SignalingStatus = 'closed';
+  private currentStatus: SignalingStatus = 'closed';
   private queue: C2S[] = [];
   private backoffMs = INITIAL_BACKOFF_MS;
   private reconnectTimer: number | null = null;
   /** Intentionally closed via close(); suppresses reconnects and sends. */
   private stopped = true;
-  /** True once any socket has opened; gates onReconnected vs first open. */
+  /**
+   * True once any socket has opened; gates onReconnected vs first open.
+   * Deliberately survives close(): after close()+connect(), the next open
+   * fires onReconnected (see the onReconnected doc).
+   */
   private everOpened = false;
 
   private messageCbs: Array<(msg: S2C) => void> = [];
@@ -81,6 +85,11 @@ export class SignalingClient {
       opts.setTimer ?? ((fn, ms) => setTimeout(fn, ms) as unknown as number);
     this.clearTimer =
       opts.clearTimer ?? ((id) => clearTimeout(id as unknown as ReturnType<typeof setTimeout>));
+  }
+
+  /** Current connection status (same value the onStatusChange stream reports). */
+  get status(): SignalingStatus {
+    return this.currentStatus;
   }
 
   /** Idempotent: starts the connection + auto-reconnect loop. */
@@ -113,10 +122,14 @@ export class SignalingClient {
   /**
    * Send a message; queued FIFO while not open and flushed on (re)open.
    * After close() this is a documented no-op until connect() is called again.
+   *
+   * The queue is UNBOUNDED during outages: sessions that emit time-sensitive
+   * traffic (e.g. ICE candidates) should clear or re-think stale queued
+   * signals in their onReconnected handler rather than rely on the backlog.
    */
   send(msg: C2S): void {
     if (this.stopped) return;
-    if (this.status === 'open' && this.socket !== null) {
+    if (this.currentStatus === 'open' && this.socket !== null) {
       try {
         this.socket.send(JSON.stringify(msg));
       } catch {
@@ -129,19 +142,49 @@ export class SignalingClient {
     }
   }
 
-  /** Inbound frames that pass parseMessage(raw, 's2c'); invalid frames are dropped silently. */
-  onMessage(cb: (msg: S2C) => void): void {
+  /**
+   * Inbound frames that pass parseMessage(raw, 's2c'); invalid frames are
+   * dropped silently. Returns an unsubscribe closure; without calling it the
+   * registration lasts the client's lifetime.
+   */
+  onMessage(cb: (msg: S2C) => void): () => void {
     this.messageCbs.push(cb);
+    return () => {
+      this.messageCbs = this.messageCbs.filter((f) => f !== cb);
+    };
   }
 
-  /** Fires on every successful (re)open EXCEPT the first — for re-claim/re-join. */
-  onReconnected(cb: () => void): void {
+  /**
+   * Fires on every successful (re)open EXCEPT the very first open of the
+   * client's lifetime — for session re-claim/re-join. Two nuances:
+   *
+   * 1. It fires AFTER the queued backlog has flushed, so messages queued
+   *    while disconnected reach the server BEFORE anything sent from this
+   *    callback (e.g. queued signals land before your re-claim).
+   * 2. "First open" is per client lifetime, not per connect(): after
+   *    close() followed by connect(), the next open DOES fire onReconnected,
+   *    since the session may still need to re-claim/re-join.
+   *
+   * Returns an unsubscribe closure; without calling it the registration
+   * lasts the client's lifetime.
+   */
+  onReconnected(cb: () => void): () => void {
     this.reconnectedCbs.push(cb);
+    return () => {
+      this.reconnectedCbs = this.reconnectedCbs.filter((f) => f !== cb);
+    };
   }
 
-  /** Status stream for UI badges; fires only on transitions. */
-  onStatusChange(cb: (s: SignalingStatus) => void): void {
+  /**
+   * Status stream for UI badges; fires only on transitions. Returns an
+   * unsubscribe closure; without calling it the registration lasts the
+   * client's lifetime.
+   */
+  onStatusChange(cb: (s: SignalingStatus) => void): () => void {
     this.statusCbs.push(cb);
+    return () => {
+      this.statusCbs = this.statusCbs.filter((f) => f !== cb);
+    };
   }
 
   // -- internals ------------------------------------------------------------
@@ -156,8 +199,10 @@ export class SignalingClient {
       const isReconnect = this.everOpened;
       this.everOpened = true;
       this.backoffMs = INITIAL_BACKOFF_MS;
-      this.setStatus('open');
+      // Flush BEFORE announcing 'open': a send() issued from inside a status
+      // callback must not jump ahead of the queued FIFO backlog.
       this.flushQueue(sock);
+      this.setStatus('open');
       if (isReconnect) {
         for (const cb of this.reconnectedCbs) cb();
       }
@@ -182,9 +227,12 @@ export class SignalingClient {
       } catch {
         // Already closing/closed.
       }
+      // Schedule the reconnect BEFORE announcing 'closed': a consumer calling
+      // connect() from inside its onStatusChange callback must hit the
+      // pending-timer guard instead of racing the reconnect loop with a
+      // second socket.
+      if (!this.stopped) this.scheduleReconnect();
       this.setStatus('closed');
-      if (this.stopped) return;
-      this.scheduleReconnect();
     };
     sock.addEventListener('close', onDown);
     sock.addEventListener('error', onDown);
@@ -212,13 +260,16 @@ export class SignalingClient {
     this.reconnectTimer = this.setTimer(() => {
       this.reconnectTimer = null;
       if (this.stopped) return;
+      // A reentrant connect() (or any other path) may already have opened a
+      // socket; never replace a live one from the reconnect loop.
+      if (this.socket !== null) return;
       this.openSocket();
     }, delay);
   }
 
   private setStatus(s: SignalingStatus): void {
-    if (s === this.status) return;
-    this.status = s;
+    if (s === this.currentStatus) return;
+    this.currentStatus = s;
     for (const cb of this.statusCbs) cb(s);
   }
 }

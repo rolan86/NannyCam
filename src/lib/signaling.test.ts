@@ -12,6 +12,8 @@ type Listener = (ev: { data?: unknown }) => void;
 class MockSocket implements WebSocketLike {
   sent: string[] = [];
   closedByClient = false;
+  /** When set, send() throws after this many successful sends. */
+  failSendsAfter: number | null = null;
   private listeners = new Map<string, Listener[]>();
 
   addEventListener(type: string, listener: Listener): void {
@@ -21,6 +23,9 @@ class MockSocket implements WebSocketLike {
   }
 
   send(data: string): void {
+    if (this.failSendsAfter !== null && this.sent.length >= this.failSendsAfter) {
+      throw new Error('socket is dead');
+    }
     this.sent.push(data);
   }
 
@@ -144,6 +149,49 @@ describe('SignalingClient send/queue', () => {
     expect(sockets[1]!.sent).toHaveLength(0);
   });
 
+  test('send that throws while open re-queues the message for the next open', () => {
+    const { client, sockets, timers } = makeClient();
+    client.connect();
+    sockets[0]!.opens();
+    sockets[0]!.failSendsAfter = 0; // every send throws from now on
+    expect(() => client.send(joinMsg)).not.toThrow();
+    expect(sockets[0]!.sent).toHaveLength(0);
+    sockets[0]!.drops();
+    timers.fireNext();
+    sockets[1]!.opens();
+    expect(sockets[1]!.sent).toEqual([JSON.stringify(joinMsg)]);
+  });
+
+  test('mid-flush send failure keeps the failed and remaining messages in order', () => {
+    const { client, sockets, timers } = makeClient();
+    client.connect();
+    const m1: C2S = { type: 'create-room' };
+    const m2: C2S = { type: 'join-room', code: 'AAAAAAAA' };
+    const m3: C2S = { type: 'join-room', code: 'BBBBBBBB' };
+    client.send(m1);
+    client.send(m2);
+    client.send(m3);
+    sockets[0]!.failSendsAfter = 1; // m1 flushes, m2 throws, m3 must not be lost
+    sockets[0]!.opens();
+    expect(sockets[0]!.sent).toEqual([JSON.stringify(m1)]);
+    sockets[0]!.drops();
+    timers.fireNext();
+    sockets[1]!.opens();
+    expect(sockets[1]!.sent).toEqual([JSON.stringify(m2), JSON.stringify(m3)]);
+  });
+
+  test('queued backlog flushes before a send() issued from the open status callback', () => {
+    const { client, sockets } = makeClient();
+    const statusSend: C2S = { type: 'join-room', code: 'CCCCCCCC' };
+    client.onStatusChange((s) => {
+      if (s === 'open') client.send(statusSend);
+    });
+    client.connect();
+    client.send(joinMsg); // queued pre-open; must stay ahead of statusSend
+    sockets[0]!.opens();
+    expect(sockets[0]!.sent).toEqual([JSON.stringify(joinMsg), JSON.stringify(statusSend)]);
+  });
+
   test('close() clears the pending queue', () => {
     const { client, sockets } = makeClient();
     client.connect();
@@ -252,6 +300,29 @@ describe('SignalingClient reconnect + backoff', () => {
     expect(timers.pendingDelays()).toHaveLength(0);
   });
 
+  test('reentrant connect() inside a closed status callback never leaks a socket', () => {
+    const { client, sockets, timers } = makeClient();
+    client.onStatusChange((s) => {
+      if (s === 'closed') client.connect();
+    });
+    client.connect();
+    sockets[0]!.opens();
+    sockets[0]!.drops();
+    // The reconnect timer is scheduled before 'closed' is announced, so the
+    // reentrant connect() must hit the pending-timer guard: one socket so
+    // far, one pending timer, never a socket+timer pair.
+    expect(sockets).toHaveLength(1);
+    expect(timers.pendingDelays()).toEqual([1000]);
+    timers.fireNext();
+    expect(sockets).toHaveLength(2);
+    expect(timers.pendingDelays()).toHaveLength(0);
+    // The replacement socket is live and never client-closed (not leaked).
+    expect(sockets[1]!.closedByClient).toBe(false);
+    sockets[1]!.opens();
+    client.send(joinMsg);
+    expect(sockets[1]!.sent).toEqual([JSON.stringify(joinMsg)]);
+  });
+
   test('connect() is idempotent', () => {
     const { client, sockets, timers } = makeClient();
     client.connect();
@@ -280,6 +351,72 @@ describe('SignalingClient callbacks', () => {
     timers.fireNext();
     sockets[2]!.opens();
     expect(fired).toBe(2);
+  });
+
+  test('onReconnected fires on the first open after close() + connect()', () => {
+    // everOpened survives close(): a restarted client still needs to
+    // re-claim/re-join, so its first re-open counts as a reconnect.
+    const { client, sockets } = makeClient();
+    let fired = 0;
+    client.onReconnected(() => fired++);
+    client.connect();
+    sockets[0]!.opens();
+    expect(fired).toBe(0);
+    client.close();
+    client.connect();
+    sockets[1]!.opens();
+    expect(fired).toBe(1);
+  });
+
+  test('onReconnected fires after the queued backlog has flushed', () => {
+    const { client, sockets, timers } = makeClient();
+    const reclaimish: C2S = { type: 'reclaim-room', code: 'ABCDEFGH', cameraToken: 'x' };
+    client.onReconnected(() => client.send(reclaimish));
+    client.connect();
+    sockets[0]!.opens();
+    sockets[0]!.drops();
+    client.send(joinMsg); // queued while disconnected
+    timers.fireNext();
+    sockets[1]!.opens();
+    // The backlog reaches the server BEFORE anything sent from onReconnected.
+    expect(sockets[1]!.sent).toEqual([JSON.stringify(joinMsg), JSON.stringify(reclaimish)]);
+  });
+
+  test('unsubscribe closures stop delivery', () => {
+    const { client, sockets, timers } = makeClient();
+    const messages: S2C[] = [];
+    let reconnects = 0;
+    const laterStatuses: string[] = [];
+    const offMessage = client.onMessage((m) => messages.push(m));
+    const offReconnected = client.onReconnected(() => reconnects++);
+    const offStatus = client.onStatusChange((s) => laterStatuses.push(s));
+    offMessage();
+    offReconnected();
+    offStatus();
+    client.connect();
+    sockets[0]!.opens();
+    sockets[0]!.receives(JSON.stringify({ type: 'camera-back' } satisfies S2C));
+    sockets[0]!.drops();
+    timers.fireNext();
+    sockets[1]!.opens();
+    expect(messages).toHaveLength(0);
+    expect(reconnects).toBe(0);
+    expect(laterStatuses).toHaveLength(0);
+  });
+
+  test('status getter tracks the onStatusChange stream', () => {
+    const { client, sockets, timers } = makeClient();
+    expect(client.status).toBe('closed');
+    client.connect();
+    expect(client.status).toBe('connecting');
+    sockets[0]!.opens();
+    expect(client.status).toBe('open');
+    sockets[0]!.drops();
+    expect(client.status).toBe('closed');
+    timers.fireNext();
+    expect(client.status).toBe('connecting');
+    client.close();
+    expect(client.status).toBe('closed');
   });
 
   test('status transitions are observable', () => {
