@@ -152,10 +152,9 @@ export function startServer(opts: StartOptions): RelayHandle {
         // room nor broadcasts peer-left.
         const staleId = cameraByRoom.get(msg.code);
         if (staleId !== undefined && staleId !== ws.data.peerId) {
+          unbind(staleId);
           const stale = peers.get(staleId);
           if (stale) {
-            stale.data.roomCode = undefined;
-            stale.data.role = undefined;
             try {
               stale.close();
             } catch {
@@ -192,8 +191,10 @@ export function startServer(opts: StartOptions): RelayHandle {
       }
 
       case 'stop-camera': {
-        // Camera-role op: a viewer may not tear down its room even if it has
-        // somehow learned the token, and a bound camera may only stop its own.
+        // The token is the real authentication; the role checks are
+        // defense-in-depth (a viewer could always open a second, unbound
+        // socket). Unbound senders with a valid token are deliberately
+        // accepted — a reconnected camera may stop without reclaiming first.
         if (ws.data.role === 'viewer') return send(ws, err('invalid'));
         if (ws.data.role === 'camera' && ws.data.roomCode !== msg.code) {
           return send(ws, err('invalid'));
@@ -221,6 +222,13 @@ export function startServer(opts: StartOptions): RelayHandle {
         // Relay only within the sender's room, only to the addressed peer.
         if (!target || target.data.roomCode !== code) return send(ws, err('invalid'));
         return send(target, { type: 'signal', from: ws.data.peerId, payload: msg.payload });
+      }
+
+      default: {
+        // Compile-time exhaustiveness: adding a seventh C2S variant without
+        // handling it here is a type error, not a silently dropped message.
+        const _exhaustive: never = msg;
+        return _exhaustive;
       }
     }
   }

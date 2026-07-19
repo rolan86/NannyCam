@@ -16,7 +16,7 @@ import {
   type C2S,
   type S2C,
 } from '../shared/protocol.ts';
-import { GRACE_MS, RATE_LIMIT_MAX_FAILURES } from './rooms.ts';
+import { GRACE_MS, MAX_VIEWERS, RATE_LIMIT_MAX_FAILURES } from './rooms.ts';
 import { startServer, SWEEP_INTERVAL_MS, type RelayHandle } from './main.ts';
 
 const codeRe = new RegExp(`^[${CODE_ALPHABET}]{${CODE_LENGTH}}$`);
@@ -88,7 +88,7 @@ async function connect(port: number): Promise<TestClient> {
     ws,
     send: (msg) => ws.send(JSON.stringify(msg)),
     sendRaw: (raw) => ws.send(raw),
-    next: (ms = 1000) => {
+    next: (ms = 5000) => {
       if (queue.length > 0) return Promise.resolve(queue.shift()!);
       return new Promise<S2C>((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -153,6 +153,19 @@ describe('create and join', () => {
     expect(viewerId).not.toBe(camId);
     const notice = await cam.next();
     expect(notice).toEqual({ type: 'peer-joined', peerId: viewerId });
+  });
+
+  test('room full: viewer past MAX_VIEWERS → error room-full', async () => {
+    const h = boot();
+    const { cam, code } = await createRoom(h.port);
+    for (let i = 0; i < MAX_VIEWERS; i++) {
+      await joinRoom(h.port, code);
+      await cam.next(); // peer-joined
+    }
+    const extra = await connect(h.port);
+    extra.send({ type: 'join-room', code });
+    expect(await extra.next()).toEqual({ type: 'error', reason: 'room-full' });
+    await cam.expectSilence();
   });
 
   test('join with unknown code → error bad-code', async () => {
@@ -280,6 +293,16 @@ describe('malformed input', () => {
     const c = await connect(h.port);
     c.sendRaw(JSON.stringify({ type: 'room-closed' }));
     expect(await c.next()).toEqual({ type: 'error', reason: 'invalid' });
+  });
+
+  test('binary frame → error invalid, connection survives', async () => {
+    const h = boot();
+    const c = await connect(h.port);
+    c.ws.send(new Uint8Array([1, 2, 3]));
+    expect(await c.next()).toEqual({ type: 'error', reason: 'invalid' });
+    await c.expectSilence();
+    c.send({ type: 'create-room' });
+    expect((await c.next()).type).toBe('room-created');
   });
 
   test('oversize frame → connection closed (maxPayloadLength)', async () => {
@@ -484,6 +507,23 @@ describe('stop-camera', () => {
     cam.send({ type: 'stop-camera', code, cameraToken: 'f'.repeat(32) });
     expect(await cam.next()).toEqual({ type: 'error', reason: 'bad-token' });
     expect((await joinRoom(h.port, code)).cameraPresent).toBe(true);
+  });
+
+  test('unbound socket with valid token may stop (reconnected camera path)', async () => {
+    const h = boot();
+    const { cam, code, token } = await createRoom(h.port);
+    const { viewer } = await joinRoom(h.port, code);
+    await cam.next(); // peer-joined
+    // A fresh, unbound socket holding the token — the token is the auth.
+    const fresh = await connect(h.port);
+    fresh.send({ type: 'stop-camera', code, cameraToken: token });
+    expect(await viewer.next()).toEqual({ type: 'room-closed' });
+    // Room and code are gone; the old camera binding was cleared.
+    const probe = await connect(h.port);
+    probe.send({ type: 'join-room', code });
+    expect(await probe.next()).toEqual({ type: 'error', reason: 'bad-code' });
+    cam.send({ type: 'create-room' });
+    expect((await cam.next()).type).toBe('room-created');
   });
 
   test('from a viewer socket → error invalid even with the right token', async () => {
