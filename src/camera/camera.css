@@ -27,3 +27,25 @@ button.danger { background: #d33; color: #fff; }
    stream. No `controls`, so this is already invisible by default; the rule
    below is belt-and-braces against any future markup change. */
 .remote-audio { display: none; }
+
+/* Task 13 — pre-flight checklist. */
+.preflight-screen { max-width: 480px; width: 100%; text-align: left; align-items: stretch; }
+.preflight-screen h1 { align-self: center; }
+.preflight-screen > .status { align-self: center; text-align: center; }
+.preflight-item { display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; background: #1b1b1b; border-radius: 8px; padding: 0.6rem 0.9rem; font-size: 0.95rem; }
+.preflight-label { color: #eee; font-weight: 600; }
+.preflight-badge { color: #aaa; text-align: right; }
+.preflight-badge-detected, .preflight-badge-charging { color: #4c9; }
+.preflight-badge-unavailable, .preflight-badge-unknown { color: #e8a33d; }
+.preflight-row { display: flex; align-items: center; gap: 0.6rem; color: #ccc; font-size: 0.95rem; }
+.preflight-row input[type='checkbox'] { width: 1.2rem; height: 1.2rem; flex-shrink: 0; }
+.preflight-tone-row { justify-content: flex-start; }
+.preflight-tone-btn { font-size: 0.95rem; padding: 0.5rem 1rem; background: #333; color: #eee; }
+.preflight-tone-hint { color: #888; font-size: 0.85rem; }
+.preflight-tip { background: #1b1b1b; border-radius: 8px; padding: 0.25rem 0.75rem; }
+.preflight-tip-toggle { width: 100%; background: none; color: #eee; font-size: 0.9rem; padding: 0.6rem 0; text-align: left; }
+.preflight-tip-body { color: #aaa; font-size: 0.85rem; line-height: 1.4; padding: 0 0 0.9rem; }
+.preflight-dedicated { border-top: 1px solid #2a2a2a; padding-top: 0.9rem; }
+.preflight-actions { display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin-top: 0.5rem; }
+.preflight-cancel { background: none; color: #999; font-size: 1rem; padding: 0.6rem 0.5rem; }
+.preflight-actions .primary:disabled { background: #245; color: #789; cursor: not-allowed; }

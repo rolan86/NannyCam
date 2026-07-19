@@ -12,6 +12,7 @@ import {
   sensitivityToThreshold,
   thresholdToSensitivity,
 } from './detectors.ts';
+import { loadDedicated, Preflight } from './preflight.tsx';
 import {
   CameraSession,
   type CameraState,
@@ -173,6 +174,11 @@ function App() {
     session.getDetectorSettings(),
   );
   const [remoteAudio, setRemoteAudio] = useState<RemoteAudioEntry[]>([]);
+  // Task 13: whether the pre-flight checklist is currently showing, entered
+  // via the idle screen's "Set up camera" button (below) and left either by
+  // "Go live" (→ session.start()) or "Back". Purely a main.tsx UI concern —
+  // CameraSession's own phase machine knows nothing about this screen.
+  const [preflightOpen, setPreflightOpen] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const qrRef = useRef<HTMLCanvasElement>(null);
 
@@ -210,15 +216,47 @@ function App() {
   };
 
   switch (state.phase) {
-    case 'idle':
+    case 'idle': {
+      // Task 13 flow: dedicated devices (persisted nannycam.dedicated —
+      // see preflight.tsx's loadDedicated) keep the pre-Task-13 direct-Start
+      // path unchanged, including the button label. Everyone else goes
+      // through the checklist first; "Go live" there is what actually calls
+      // session.start(). Read fresh on every 'idle' render (cheap
+      // synchronous localStorage read) rather than cached in state, so
+      // toggling "dedicated device" mid-checklist and backing out
+      // immediately reflects on the idle screen without a reload.
+      const dedicated = loadDedicated(localStorage);
+      if (dedicated) {
+        return (
+          <main class="center">
+            <h1>NannyCam</h1>
+            <button class="primary" onClick={() => void session.start()}>
+              Start camera
+            </button>
+          </main>
+        );
+      }
+      if (preflightOpen) {
+        return (
+          <Preflight
+            storage={localStorage}
+            onGoLive={() => {
+              setPreflightOpen(false);
+              void session.start();
+            }}
+            onCancel={() => setPreflightOpen(false)}
+          />
+        );
+      }
       return (
         <main class="center">
           <h1>NannyCam</h1>
-          <button class="primary" onClick={() => void session.start()}>
-            Start camera
+          <button class="primary" onClick={() => setPreflightOpen(true)}>
+            Set up camera
           </button>
         </main>
       );
+    }
     case 'acquiring-media':
       return (
         <main class="center">

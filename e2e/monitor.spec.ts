@@ -56,6 +56,16 @@ async function pairCameraAndViewer(browser: Browser): Promise<Pairing> {
   const viewerCtx = await browser.newContext();
   const consoleErrors: string[] = [];
 
+  // Task 13: preseed the "dedicated device" flag on every page this context
+  // ever navigates to (including the revived camera page later in the DOWN/
+  // recovery test, which reuses cameraCtx) — this suite is about pairing/
+  // frame-flow/watchdog/talk-back, not the pre-flight checklist itself (see
+  // preflight.spec.ts for that), so it keeps the pre-Task-13 direct "Start
+  // camera" click working unchanged.
+  await cameraCtx.addInitScript(() => {
+    window.localStorage.setItem('nannycam.dedicated', 'true');
+  });
+
   const cameraPage = await cameraCtx.newPage();
   cameraPage.on('console', (msg) => {
     if (msg.type() === 'error') consoleErrors.push(`[camera] ${msg.text()}`);
