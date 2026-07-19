@@ -364,6 +364,13 @@ export class CameraSession {
     this.releaseWakeLock();
     this.detectors.attachMotionSource(null);
     this.detectors.setRunning(false); // tears down both the noise (+ its AudioContext) and motion sources
+    // Review fix (adversarial fuzz / extraction divergence): without this,
+    // DetectorController's cached `live` flag stays true across stop(), so a
+    // later start() (setRunning(true), while `stream` is already set) would
+    // start the noise analyser immediately during 'acquiring-media'/
+    // 'connecting' — before phase ever reaches 'live' again. Pre-extraction
+    // behavior gated strictly on phase === 'live'; this restores it.
+    this.detectors.setLive(false);
     this.storage.removeItem(STORAGE_CODE_KEY);
     this.storage.removeItem(STORAGE_TOKEN_KEY);
     this.location.hash = '';
@@ -661,6 +668,10 @@ export class CameraSession {
     this.releaseWakeLock();
     this.detectors.attachMotionSource(null);
     this.detectors.setRunning(false);
+    // Review fix — same divergence as stop(): the cached `live` flag must
+    // not survive a failure teardown either, or a Retry (start() again)
+    // would start the noise analyser before phase reaches 'live'.
+    this.detectors.setLive(false);
     this.setState({ phase: 'error', error: message, viewerCount: 0 });
   }
 

@@ -169,8 +169,10 @@ function fakeMicTrack(): FakeMicTrack {
     kind: 'audio',
     enabled: true,
     stopped: false,
+    readyState: 'live' as 'live' | 'ended',
     stop() {
       t.stopped = true;
+      t.readyState = 'ended'; // matches real MediaStreamTrack.stop() semantics
     },
   };
   return t as unknown as FakeMicTrack;
@@ -901,5 +903,67 @@ describe('push-to-talk', () => {
     expect(h.last().phase).toBe('error');
     expect(track.stopped).toBe(true);
     expect(h.last().talk).toBe('idle');
+  });
+});
+
+// -- push-to-talk races (adversarial-fuzz review fixes) ----------------------
+
+describe('push-to-talk: prompt-in-flight races', () => {
+  test('late mic grant after leave() stops the track immediately — readyState "ended", never stored', async () => {
+    const h = liveWithMic();
+    const p = h.session.startTalk(); // prompt pending
+    expect(h.last().talk).toBe('requesting-mic');
+    expect(h.mic.pendingCount()).toBe(1);
+
+    h.session.leave(); // torn down while the prompt is still open
+    expect(h.last().phase).toBe('idle');
+    expect(h.last().talk).toBe('idle');
+
+    const track = h.mic.resolveNext(); // the OS grants access AFTER leave()
+    await p;
+
+    expect(track.stopped).toBe(true);
+    expect(track.readyState).toBe('ended'); // stopped: can't capture audio regardless of .enabled
+    expect(h.last().talk).toBe('idle'); // untouched by the late grant
+  });
+
+  test('release then press again while the FIRST prompt is still pending reuses the SAME request — one getUserMedia call, no orphaned track', async () => {
+    const h = liveWithMic();
+    const p1 = h.session.startTalk(); // press 1: the ONE getUserMedia call
+    expect(h.mic.pendingCount()).toBe(1);
+
+    h.session.stopTalk(); // release before the prompt resolves
+    expect(h.last().talk).toBe('idle');
+
+    const p2 = h.session.startTalk(); // press 2: mic still not acquired
+    expect(h.mic.pendingCount()).toBe(1); // NOT a second concurrent getUserMedia call
+
+    const track = h.mic.resolveNext();
+    await Promise.all([p1, p2]);
+
+    expect(h.mic.calls()).toBe(1); // exactly one getUserMedia call, ever
+    expect(h.transceiver.replaceTrackCalls).toEqual([track]); // exactly one stored/attached track
+    expect(h.last().talk).toBe('talking');
+    expect(track.enabled).toBe(true);
+    expect(track.stopped).toBe(false); // no orphan to have stopped
+  });
+
+  test('a peer replacement (reclaim) while the mic prompt is pending stores the track disabled and requires a fresh press', async () => {
+    const h = liveWithMic();
+    const p = h.session.startTalk(); // prompt pending — micTrack still null
+    expect(h.last().talk).toBe('requesting-mic');
+
+    // Reclaimed camera under a fresh peerId WHILE the prompt is still open.
+    h.signaling.receive({ type: 'signal', from: 'cam-2', payload: 'fresh-offer' });
+    expect(h.peers).toHaveLength(2);
+    const newTransceiver = h.peers[1]!.transceivers[0]!;
+
+    const track = h.mic.resolveNext(); // the OS grants access AFTER the replacement
+    await p;
+
+    expect(h.last().talk).toBe('idle'); // NOT 'talking' — a fresh press is required
+    expect(newTransceiver.sender.track).toBe(track); // attached to the NEW connection...
+    expect(track.enabled).toBe(false); // ...but disabled, per the fresh-press-per-connection rule
+    expect(track.stopped).toBe(false); // still usable — a fresh press on THIS connection needs no new prompt
   });
 });

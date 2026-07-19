@@ -881,6 +881,61 @@ describe('detectors', () => {
     expect(h.motionSources.created[0]!.stopped).toBe(true);
   });
 
+  test('review fix: stop() then start() does not restart the noise detector until phase reaches live again', async () => {
+    // Adversarial-fuzz finding: DetectorController's cached `live` flag
+    // stayed true across stop() (only setRunning(false) was called, never
+    // setLive(false)), so a restart's setRunning(true) — which runs while
+    // `stream` is already set, well before room-created — would start the
+    // noise analyser immediately during 'acquiring-media'/'connecting'.
+    // Pre-extraction behavior gated strictly on phase === 'live'.
+    const h = makeHarness({ detectors: { noiseEnabled: true } });
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    expect(h.noiseSources.created).toHaveLength(1);
+
+    h.session.stop();
+    expect(h.noiseSources.created[0]!.stopped).toBe(true);
+
+    await h.session.start();
+    expect(h.last().phase).toBe('connecting'); // NOT live yet
+    expect(h.noiseSources.created).toHaveLength(1); // still just the one from before — no premature restart
+
+    h.signaling.receive(ROOM_CREATED); // NOW it reaches live
+    expect(h.noiseSources.created).toHaveLength(2);
+    expect(h.noiseSources.created[1]!.stopped).toBe(false);
+  });
+
+  test('review fix: failSession() also carries the live-flag fix (compound path: reconnect → rate-limited → retry)', async () => {
+    // failSession() is only reachable while an entry-ladder attempt is in
+    // flight (handleErrorReason's rate-limited case gates on `attempt !==
+    // null`), and the ONLY way to re-arm `attempt` after having been live is
+    // via handleReconnected() — which already calls setLive(false) itself.
+    // So this compound path can't fully ISOLATE failSession's own
+    // setLive(false) line from handleReconnected's (today's call graph makes
+    // them inseparable), but it does pin the full compound teardown chain
+    // stays correct, and the one-line fix is kept for symmetry/robustness
+    // against future call-graph changes that might reach failSession()
+    // directly from a live state.
+    const h = makeHarness({ detectors: { noiseEnabled: true } });
+    await h.session.start();
+    h.signaling.receive(ROOM_CREATED);
+    expect(h.noiseSources.created).toHaveLength(1);
+
+    h.signaling.reconnect(); // rung 2: re-arms `attempt` via runEntryLadder
+    expect(h.last().phase).toBe('connecting');
+    expect(h.noiseSources.created[0]!.stopped).toBe(true); // already stopped by setLive(false)
+
+    h.signaling.receive({ type: 'error', reason: 'rate-limited' }); // attempt !== null: failSession() runs
+    expect(h.last().phase).toBe('error');
+
+    await h.session.start(); // Retry
+    expect(h.last().phase).toBe('connecting');
+    expect(h.noiseSources.created).toHaveLength(1); // no premature restart
+
+    h.signaling.receive(ROOM_CREATED);
+    expect(h.noiseSources.created).toHaveLength(2);
+  });
+
   test('settings persist to storage and are reloaded by a fresh session sharing that storage', () => {
     const h = makeHarness();
     h.session.setNoiseThreshold(0.42);

@@ -174,11 +174,41 @@ export class ViewerSession {
   /**
    * The mic track acquired on the FIRST press, if any. Carried across peer
    * replacements (no repeat getUserMedia prompt) — see adoptPeer's doc.
-   * Released (track.stop()) only on leave()/'ended' — see releaseMic().
+   * Released (track.stop()) on leave()/'ended'/fail(), and on any
+   * getUserMedia grant that resolves AFTER one of those already ran (see
+   * startTalk's teardownEpoch check) — see releaseMic().
    */
   private micTrack: MediaStreamTrack | null = null;
   /** The current camera Peer's mic transceiver; re-added on every adoption. */
   private micTransceiver: RtpTransceiverLike | null = null;
+  /**
+   * In-flight getUserMedia() latch (review fix, adversarial fuzz): press →
+   * release → press again while the FIRST prompt is still pending must
+   * reuse the SAME promise rather than firing a second concurrent
+   * getUserMedia call, which would silently orphan whichever track resolves
+   * first (acquired, live, never attached/stopped again). Cleared by
+   * releaseMic() too, so a press after a teardown always starts fresh
+   * rather than potentially waiting on a stale pre-teardown prompt.
+   */
+  private micRequest: Promise<MediaStreamTrack | null> | null = null;
+  /**
+   * Bumped by releaseMic() (leave()/'ended'/fail()) — lets a getUserMedia
+   * grant that resolves AFTER a teardown recognize it's stale and self-clean
+   * (stop the track, don't store it) instead of leaking a live mic with no
+   * UI path back to release it (review fix, adversarial fuzz: repro was
+   * press → leave() while the prompt is open → grant arrives late).
+   */
+  private teardownEpoch = 0;
+  /**
+   * Bumped by adoptPeer() — lets a getUserMedia grant that resolves AFTER a
+   * peer replacement (reclaim/reconnect) recognize the "fresh press per
+   * connection" rule applies to IT too: store the track disabled and
+   * require a new press, rather than completing 'talking' on a connection
+   * the user never explicitly armed (review fix, adversarial fuzz: repro
+   * was press → adoption happens while the prompt is open → grant arrives
+   * after, previously completed 'talking' on the new peer unconditionally).
+   */
+  private adoptionEpoch = 0;
 
   constructor(opts: ViewerSessionOptions) {
     this.signaling = opts.signaling;
@@ -334,6 +364,22 @@ export class ViewerSession {
   }
 
   /**
+   * Run getUserMedia() and extract its first audio track. Returns null on
+   * denial/failure, or on a stream with no audio track — startTalk treats
+   * both the same way (mic-denied). Never throws: this is also the payload
+   * of the in-flight-request latch (micRequest), and concurrent presses
+   * awaiting the SAME call must never see it reject.
+   */
+  private async acquireMicTrack(): Promise<MediaStreamTrack | null> {
+    try {
+      const stream = await this.getMic();
+      return stream.getAudioTracks()[0] ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Press-and-hold gesture, start half: pointerdown on the PTT button.
    * First-ever call acquires the mic (getUserMedia) and attaches it to the
    * pre-negotiated transceiver via replaceTrack — no renegotiation, since
@@ -344,40 +390,96 @@ export class ViewerSession {
    * (the UI only renders the button while phase === 'live', by which point
    * adoptPeer has already run at least once, so micTransceiver is set) —
    * defensive null-checks below cover it anyway.
+   *
+   * Three races an adversarial-fuzz review found in the naive version
+   * (press → await → store unconditionally), all fixed here:
+   *  1. Hot mic after teardown: press, then leave()/'ended'/fail() while the
+   *     prompt is still open, then the OS grants access. teardownEpoch
+   *     (bumped by releaseMic()) is captured up front and re-checked after
+   *     every await; a mismatch means "nothing left to attach to" — the
+   *     freshly-granted track is stopped immediately, never stored.
+   *  2. Double getUserMedia: press → release → press again before the FIRST
+   *     prompt resolves used to fire a SECOND concurrent getUserMedia call,
+   *     orphaning whichever track resolved first. micRequest latches the
+   *     in-flight promise so a second press reuses it — exactly one
+   *     getUserMedia call ever, exactly one track stored.
+   *  3. Adoption mid-request: press, then a peer replacement (reclaim/
+   *     reconnect) lands while the prompt is open, then the OS grants
+   *     access. adoptionEpoch (bumped by adoptPeer()) is captured up front
+   *     and re-checked after every await; a mismatch means the "fresh press
+   *     per connection" rule (see adoptPeer's doc) applies to this press
+   *     too — the track is stored + attached (disabled) to the NEW
+   *     transceiver, but talk goes back to 'idle' rather than 'talking'.
    */
   async startTalk(): Promise<void> {
     const talk = this.state.talk;
     if (talk === 'talking' || talk === 'requesting-mic') return;
     if (this.micTrack === null) {
+      const teardownAtStart = this.teardownEpoch;
+      const adoptionAtStart = this.adoptionEpoch;
       this.setState({ talk: 'requesting-mic' });
-      let stream: MediaStream;
-      try {
-        stream = await this.getMic();
-      } catch {
-        // Only surface mic-denied if the button is still held — a
-        // stopTalk() (release) during the prompt already reset to 'idle'
-        // and must not be clobbered by a late denial.
-        if (this.state.talk === 'requesting-mic') this.setState({ talk: 'mic-denied' });
+
+      // Race #2: reuse an in-flight request instead of firing a second
+      // getUserMedia call.
+      if (this.micRequest === null) this.micRequest = this.acquireMicTrack();
+      const request = this.micRequest;
+      const track = await request;
+      if (this.micRequest === request) this.micRequest = null;
+
+      if (track === null) {
+        // Only surface mic-denied if the button is still held for THIS
+        // press/generation — a stopTalk() (release) during the prompt
+        // already reset to 'idle' and must not be clobbered by a late
+        // denial; a torn-down session has nothing to show it in anyway.
+        if (this.state.talk === 'requesting-mic' && this.teardownEpoch === teardownAtStart) {
+          this.setState({ talk: 'mic-denied' });
+        }
         return;
       }
-      const track = stream.getAudioTracks()[0];
-      if (track === undefined) {
-        if (this.state.talk === 'requesting-mic') this.setState({ talk: 'mic-denied' });
-        return;
-      }
-      track.enabled = false; // flipped true below only if the press is still live
-      this.micTrack = track;
-      if (this.micTransceiver !== null) {
+
+      // Race #1: torn down while we were awaiting the prompt — nothing left
+      // to attach to, and no UI path back to release it later. Stop it
+      // immediately rather than storing/leaking a live track.
+      if (this.teardownEpoch !== teardownAtStart) {
         try {
-          await this.micTransceiver.sender.replaceTrack(track);
+          track.stop();
         } catch {
-          // Non-fatal: PTT audio just won't flow; the rest of the session
-          // (video, alerts, etc.) is unaffected.
+          // Already stopped.
+        }
+        return;
+      }
+
+      // Only the FIRST continuation to observe micTrack still null does the
+      // store+attach; a second press that joined the same in-flight request
+      // (race #2) sees micTrack already set (to the SAME track, set
+      // synchronously below before any further await) and skips straight to
+      // the shared checks after this block — avoids a redundant second
+      // replaceTrack call.
+      if (this.micTrack === null) {
+        track.enabled = false; // flipped true below only if still applicable
+        this.micTrack = track;
+        if (this.micTransceiver !== null) {
+          try {
+            await this.micTransceiver.sender.replaceTrack(track);
+          } catch {
+            // Non-fatal: PTT audio just won't flow; the rest of the session
+            // (video, alerts, etc.) is unaffected.
+          }
+        }
+        // Teardown can also land during the replaceTrack await above.
+        if (this.teardownEpoch !== teardownAtStart) {
+          this.releaseMic();
+          return;
         }
       }
+
+      // Race #3: a peer replacement happened while we were awaiting.
+      if (this.adoptionEpoch !== adoptionAtStart) {
+        if (this.state.talk === 'requesting-mic') this.setState({ talk: 'idle' });
+        return;
+      }
       // The button may have been released while awaiting getUserMedia/
-      // replaceTrack above (or the peer/session torn down entirely) — don't
-      // hot-mic a press that already ended.
+      // replaceTrack above — don't hot-mic a press that already ended.
       if (this.state.talk !== 'requesting-mic') return;
     }
     this.micTrack.enabled = true;
@@ -626,6 +728,11 @@ export class ViewerSession {
       this.setRemoteStream(null);
       if (this.state.phase === 'live') this.setState({ phase: 'waiting-camera' });
     }
+    // Review fix (adversarial fuzz): bumped on EVERY adoption (not just
+    // "replacing" ones) so startTalk() can tell whether a peer replacement
+    // happened while its getUserMedia prompt was still pending — see its
+    // "Race #3" doc.
+    this.adoptionEpoch++;
     const peer = this.createPeer({
       role: 'viewer', // polite side of perfect negotiation: always answers
       remotePeerId,
@@ -684,12 +791,24 @@ export class ViewerSession {
 
   /**
    * Release the acquired mic track (if any) — its underlying device LED
-   * must go off. Called only from leave() and the room-closed ('ended')
-   * handler — NOT from closePeer()/adoptPeer() replacements, which
-   * deliberately carry the track across a reclaim/reconnect rather than
-   * re-prompting for permission (see adoptPeer's Task 12 doc).
+   * must go off. Called from leave(), the room-closed ('ended') handler,
+   * fail() (dead-end error states — a rate-limit mid-press has no UI path
+   * back otherwise), AND internally by startTalk() when a teardown races a
+   * still-in-flight replaceTrack. NOT from closePeer()/adoptPeer()
+   * replacements, which deliberately carry the track across a reclaim/
+   * reconnect rather than re-prompting for permission (see adoptPeer's
+   * Task 12 doc).
+   *
+   * Bumps teardownEpoch and clears the micRequest latch unconditionally
+   * (even with no track yet acquired) — a getUserMedia prompt that is still
+   * pending at teardown time needs BOTH: the epoch bump lets its eventual
+   * resolution recognize it's stale (see startTalk), and clearing the latch
+   * means a FRESH press after this point always starts its own new
+   * getUserMedia call rather than potentially waiting on the stale one.
    */
   private releaseMic(): void {
+    this.teardownEpoch++;
+    this.micRequest = null;
     if (this.micTrack !== null) {
       try {
         this.micTrack.stop();
