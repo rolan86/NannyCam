@@ -1,13 +1,16 @@
-// E2E pairing + frame-flow test — the one true end-to-end check that a real
-// (fake-device) camera and a real (fake-device) viewer, running in two
-// separate browser CONTEXTS (i.e. two separate "devices"), can pair over the
-// relay and actually push decodable video frames peer-to-peer.
+// E2E pairing + frame-flow + watchdog test — the one true end-to-end check
+// that a real (fake-device) camera and a real (fake-device) viewer, running
+// in two separate browser CONTEXTS (i.e. two separate "devices"), can pair
+// over the relay, push decodable video frames peer-to-peer, and — the
+// safety-critical part (Task 10) — that the viewer alarms loudly when the
+// camera dies and silently, automatically recovers when it comes back.
 //
 // Everything below it (unit/integration tests) mocks getUserMedia/RTCPeer
 // Connection; this is the only test that exercises the real WebRTC stack
 // end-to-end, so it is the pipeline's ultimate correctness gate.
 
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Browser, type BrowserContext, type Page } from '@playwright/test';
+import { CODE_LENGTH } from '../shared/protocol.ts';
 
 /**
  * Pull the decoded-video-frame counter off the CURRENT camera peer's stats.
@@ -32,41 +35,74 @@ async function framesDecoded(page: Page): Promise<number> {
   });
 }
 
-test('camera and viewer pair and video frames flow', async ({ browser }) => {
-  // Two separate browser contexts == two separate "devices"; a single
-  // context sharing cookies/storage would not exercise the real pairing
-  // path the way an actual camera + viewer on different devices would.
+interface Pairing {
+  cameraCtx: BrowserContext;
+  viewerCtx: BrowserContext;
+  cameraPage: Page;
+  viewerPage: Page;
+  roomCode: string;
+  /** Diagnostic-only console errors from both pages (never asserted on). */
+  consoleErrors: string[];
+}
+
+/**
+ * Pair a fresh camera + viewer (two separate browser contexts == two
+ * separate "devices") and wait until the viewer reports 'live'. Shared setup
+ * for every test in this file — extracted so each test only needs to
+ * describe what it does DIFFERENTLY after pairing.
+ */
+async function pairCameraAndViewer(browser: Browser): Promise<Pairing> {
   const cameraCtx = await browser.newContext();
   const viewerCtx = await browser.newContext();
+  const consoleErrors: string[] = [];
+
+  const cameraPage = await cameraCtx.newPage();
+  cameraPage.on('console', (msg) => {
+    if (msg.type() === 'error') consoleErrors.push(`[camera] ${msg.text()}`);
+  });
+  await cameraPage.goto('/camera.html');
+  await cameraPage.getByRole('button', { name: 'Start camera' }).click();
+
+  const roomCodeEl = cameraPage.getByTestId('room-code');
+  await expect(roomCodeEl).toBeVisible({ timeout: 10_000 });
+  const roomCode = (await roomCodeEl.textContent())?.trim() ?? '';
+  expect(roomCode).toHaveLength(CODE_LENGTH);
+
+  const viewerPage = await viewerCtx.newPage();
+  viewerPage.on('console', (msg) => {
+    if (msg.type() === 'error') consoleErrors.push(`[viewer] ${msg.text()}`);
+  });
+  await viewerPage.goto(`/viewer.html#${roomCode}`);
+  await viewerPage.getByTestId('join-btn').click();
+
+  // Status line reaches 'live' once the camera's track arrives.
+  await expect(viewerPage.getByTestId('status')).toHaveText(/live/, {
+    timeout: 10_000,
+  });
+
+  return { cameraCtx, viewerCtx, cameraPage, viewerPage, roomCode, consoleErrors };
+}
+
+/** Close both contexts; a teardown failure in one must not hide the other's. */
+async function teardown(cameraCtx: BrowserContext, viewerCtx: BrowserContext): Promise<void> {
+  const results = await Promise.allSettled([cameraCtx.close(), viewerCtx.close()]);
+  for (const r of results) {
+    if (r.status === 'rejected') console.log('[e2e] context teardown error:', r.reason);
+  }
+}
+
+function logConsoleErrors(consoleErrors: string[]): void {
+  // Diagnostic only (not asserted): surfaces real-browser console errors in
+  // the report without making the test brittle to benign warnings.
+  if (consoleErrors.length > 0) {
+    console.log('[e2e] console errors observed:\n' + consoleErrors.join('\n'));
+  }
+}
+
+test('camera and viewer pair and video frames flow', async ({ browser }) => {
+  const { cameraCtx, viewerCtx, viewerPage, consoleErrors } = await pairCameraAndViewer(browser);
 
   try {
-    const cameraPage = await cameraCtx.newPage();
-    const consoleErrors: string[] = [];
-    cameraPage.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(`[camera] ${msg.text()}`);
-    });
-
-    await cameraPage.goto('/camera.html');
-    await cameraPage.getByRole('button', { name: 'Start camera' }).click();
-
-    const roomCodeEl = cameraPage.getByTestId('room-code');
-    await expect(roomCodeEl).toBeVisible({ timeout: 10_000 });
-    const roomCode = (await roomCodeEl.textContent())?.trim() ?? '';
-    expect(roomCode).toHaveLength(8);
-
-    const viewerPage = await viewerCtx.newPage();
-    viewerPage.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(`[viewer] ${msg.text()}`);
-    });
-
-    await viewerPage.goto(`/viewer.html#${roomCode}`);
-    await viewerPage.getByTestId('join-btn').click();
-
-    // Status line reaches 'live' once the camera's track arrives.
-    await expect(viewerPage.getByTestId('status')).toHaveText(/live/, {
-      timeout: 10_000,
-    });
-
     const video = viewerPage.getByTestId('viewer-video');
     await expect(video).toBeVisible();
     await expect
@@ -83,13 +119,71 @@ test('camera and viewer pair and video frames flow', async ({ browser }) => {
     const second = await framesDecoded(viewerPage);
     expect(second).toBeGreaterThan(first);
 
-    // Diagnostic only (not asserted): surfaces real-browser console errors
-    // in the report without making the test brittle to benign warnings.
-    if (consoleErrors.length > 0) {
-      console.log('[e2e] console errors observed:\n' + consoleErrors.join('\n'));
-    }
+    logConsoleErrors(consoleErrors);
   } finally {
-    await cameraCtx.close();
-    await viewerCtx.close();
+    await teardown(cameraCtx, viewerCtx);
+  }
+});
+
+// This test IS the product guarantee (see docs/superpowers/specs/
+// 2026-07-19-nannycam-design.md, "Failure Handling"): a monitor that fails
+// silently is worse than no monitor at all, and recovery must need zero
+// viewer-side interaction — nobody re-taps a phone propped up watching a
+// sleeping baby.
+test('camera death alarms viewer, revival auto-recovers', async ({ browser }) => {
+  const { cameraCtx, viewerCtx, cameraPage, viewerPage, roomCode, consoleErrors } =
+    await pairCameraAndViewer(browser);
+
+  try {
+    // Confirm frames are genuinely flowing before killing the camera — a
+    // meaningful baseline, not just a connected-but-frozen video element.
+    const video = viewerPage.getByTestId('viewer-video');
+    await expect
+      .poll(() => video.evaluate((el: HTMLVideoElement) => el.videoWidth), {
+        timeout: 10_000,
+      })
+      .toBeGreaterThan(0);
+
+    // Kill the camera page entirely — simulates the phone dying hard enough
+    // that its WS socket drops (call interruption / backgrounding / crash).
+    // The relay sees the socket close and tells the viewer immediately
+    // (peer-left); recovery from there is entirely the watchdog's missed-
+    // heartbeat detection (no instant-DOWN special-case — see monitor.ts).
+    await cameraPage.close();
+
+    await expect(viewerPage.locator('[data-state="down"]')).toBeVisible({
+      timeout: 8_000,
+    });
+
+    // Revive: a NEW page in the SAME camera context. localStorage (room code
+    // + camera token) is per-origin-per-context and survives the closed
+    // page, so Start reclaims the SAME room instead of minting a new one.
+    // Start requires a real click (getUserMedia needs a user gesture) — this
+    // is the one designed tap, on the CAMERA side. Zero taps on the viewer
+    // from here on: auto-reclaim -> re-offer -> viewer's lazy peer-adoption
+    // -> watchdog reset() -> back to live, unattended.
+    const revivedCameraPage = await cameraCtx.newPage();
+    revivedCameraPage.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(`[camera-revived] ${msg.text()}`);
+    });
+    await revivedCameraPage.goto('/camera.html');
+    await revivedCameraPage.getByRole('button', { name: 'Start camera' }).click();
+    await expect(revivedCameraPage.getByTestId('room-code')).toHaveText(roomCode, {
+      timeout: 10_000,
+    });
+
+    // Zero viewer-page interactions from here to recovery.
+    await expect(viewerPage.locator('[data-state="live"]')).toBeVisible({
+      timeout: 15_000,
+    });
+
+    const first = await framesDecoded(viewerPage);
+    await viewerPage.waitForTimeout(2_000);
+    const second = await framesDecoded(viewerPage);
+    expect(second).toBeGreaterThan(first);
+
+    logConsoleErrors(consoleErrors);
+  } finally {
+    await teardown(cameraCtx, viewerCtx);
   }
 });

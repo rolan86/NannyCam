@@ -110,6 +110,7 @@ export class ViewerSession {
   private streamCbs: Array<(stream: MediaStream | null) => void> = [];
   private dataCbs: Array<(text: string) => void> = [];
   private connStateCbs: Array<(s: RTCPeerConnectionState) => void> = [];
+  private peerAdoptedCbs: Array<() => void> = [];
 
   /** The single camera Peer (see the file-header discovery note). */
   private peer: PeerLike | null = null;
@@ -199,6 +200,23 @@ export class ViewerSession {
     this.connStateCbs.push(cb);
     return () => {
       this.connStateCbs = this.connStateCbs.filter((f) => f !== cb);
+    };
+  }
+
+  /**
+   * Fires whenever a camera Peer is (re)created — the first one at initial
+   * join, and again on every reclaim/reconnect replacement. Gap identified
+   * while wiring Task 10: the watchdog needs to reset() (fresh grace period)
+   * exactly at adoption time, BEFORE the new peer's track/heartbeats arrive,
+   * and no existing hook signals that moment (onConnectionState/
+   * onDataMessage are peer-content streams, not an adoption edge). Fires
+   * synchronously from adoptPeer(), before that peer's other callbacks are
+   * wired. Returns an unsubscribe closure.
+   */
+  onPeerAdopted(cb: () => void): () => void {
+    this.peerAdoptedCbs.push(cb);
+    return () => {
+      this.peerAdoptedCbs = this.peerAdoptedCbs.filter((f) => f !== cb);
     };
   }
 
@@ -487,6 +505,10 @@ export class ViewerSession {
         this.signaling.send({ type: 'signal', to: remotePeerId, payload }),
     });
     this.peer = peer;
+    // Adoption edge (Task 10): fire before the peer's own callbacks are
+    // wired below, so a subscriber resetting a watchdog can't race the first
+    // connection-state/track event from the peer it's about to reset for.
+    for (const cb of [...this.peerAdoptedCbs]) cb();
     this.peerUnsubs.push(
       peer.onTrack((ev) => {
         const stream = ev.streams[0];
