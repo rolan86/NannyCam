@@ -27,7 +27,25 @@ import { RoomManager } from './rooms.ts';
 export const SWEEP_INTERVAL_MS = 1000;
 
 interface SocketData {
-  /** Server-generated peer id; doubles as the rate-limiter connection id. */
+  /**
+   * Server-generated peer id; doubles as the rate-limiter connection id
+   * (RoomManager's joinRoom/recreateRoom/reclaimRoom all key their sliding
+   * failure window on this string — see rooms.ts). Task 14 decision, worth
+   * documenting explicitly: this is per-CONNECTION identity, not per-IP.
+   * A reconnecting client gets a fresh peerId and therefore a fresh rate
+   * limit window — an attacker who can freely reconnect (nothing here rate
+   * limits raw TCP/WS connection attempts) resets their own budget for
+   * free. Accepted for this app's actual deployment model: a private
+   * tailnet exposed via tailscale serve, not the open internet. IP-level
+   * limiting is deliberately out of scope, and not just as a "not yet"
+   * shortcut — it would be actively misleading here, because Bun's `req`
+   * sees whatever address tailscale serve's local reverse-proxy connects
+   * from (typically loopback), not the tailnet peer's real IP. Getting a
+   * real per-peer IP would need trusting a forwarded-for style header from
+   * that proxy, which is its own can of worms for a single-binary app this
+   * size. The 64 KB frame cap, the MAX_ROOMS cap, and one-room-per-socket
+   * are the belt-and-suspenders layers that don't depend on IP identity.
+   */
   peerId: string;
   /** Set while the socket is bound to a room. One room per socket, ever. */
   roomCode?: string;
@@ -56,6 +74,31 @@ export interface RelayHandle {
 }
 
 const err = (reason: ErrorReason): S2C => ({ type: 'error', reason });
+
+/**
+ * Task 14: every HTTP response carries this CSP — the mechanical enforcement
+ * of the spec's "no external requests" rule. `connect-src` allows both
+ * `wss:` (production: tailscale serve terminates TLS in front of this
+ * process, so the app always sees itself as https:// and dials wss://) and
+ * `ws:` (the e2e suite boots the bare Bun server on plain http://localhost,
+ * so SignalingClient's `location.protocol === 'https:' ? 'wss' : 'ws'`
+ * dials ws:// there — without this the whole e2e suite would fail closed
+ * under its own CSP). `img-src 'self' data:` covers qrcode's `toCanvas`,
+ * which draws directly to a <canvas> (no data: URI actually crosses the
+ * wire) — kept anyway as harmless slack matching the spec string exactly.
+ * `media-src 'self' blob:` covers the <video>/<audio> elements' MediaStream
+ * srcObject assignments (WebRTC-internal, not a network fetch, but some
+ * engines still gate srcObject through media-src). No `script-src` override:
+ * default-src 'self' already blocks inline/external scripts, and Vite emits
+ * only external, hashed, same-origin module scripts — no nonce needed.
+ */
+const CSP =
+  "default-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self' wss: ws:";
+
+function withCsp(res: Response): Response {
+  res.headers.set('Content-Security-Policy', CSP);
+  return res;
+}
 
 export function startServer(opts: StartOptions): RelayHandle {
   const distDir = normalize(opts.distDir ?? join(import.meta.dir, '..', 'dist'));
@@ -117,11 +160,18 @@ export function startServer(opts: StartOptions): RelayHandle {
       case 'create-room': {
         // One room per socket: a socket already bound to a live room may not
         // mint or enter another (caps hostile room-minting at connection
-        // count; Task 14 adds a global cap).
+        // count). RoomManager.createRoom also enforces the global MAX_ROOMS
+        // cap (Task 14) as a belt-and-suspenders backstop over this.
         if (ws.data.roomCode !== undefined) return send(ws, err('invalid'));
-        const { code, cameraToken } = rooms.createRoom();
-        bindCamera(ws, code);
-        return send(ws, { type: 'room-created', code, cameraToken, peerId: ws.data.peerId });
+        const res = rooms.createRoom();
+        if (!res.ok) return send(ws, err(res.reason));
+        bindCamera(ws, res.code);
+        return send(ws, {
+          type: 'room-created',
+          code: res.code,
+          cameraToken: res.cameraToken,
+          peerId: ws.data.peerId,
+        });
       }
 
       case 'recreate-room': {
@@ -144,7 +194,10 @@ export function startServer(opts: StartOptions): RelayHandle {
 
       case 'reclaim-room': {
         if (ws.data.roomCode !== undefined) return send(ws, err('invalid'));
-        const res = rooms.reclaimRoom(msg.code, msg.cameraToken);
+        // connectionId: Task 14 routes reclaim failures through the same
+        // per-connection rate limiter as join/recreate (see reclaimRoom's
+        // doc) — peerId doubles as the connection id (SocketData's doc).
+        const res = rooms.reclaimRoom(msg.code, msg.cameraToken, ws.data.peerId);
         if (!res.ok) return send(ws, err(res.reason));
         // Spec: reclaim is allowed while the camera is still marked present
         // (its disconnect may not have been observed yet). Detach the stale
@@ -195,6 +248,8 @@ export function startServer(opts: StartOptions): RelayHandle {
         // defense-in-depth (a viewer could always open a second, unbound
         // socket). Unbound senders with a valid token are deliberately
         // accepted — a reconnected camera may stop without reclaiming first.
+        // Task 14: re-verified against stopCamera's own token check
+        // (rooms.ts, now constant-time) — still accurate, no change needed.
         if (ws.data.role === 'viewer') return send(ws, err('invalid'));
         if (ws.data.role === 'camera' && ws.data.roomCode !== msg.code) {
           return send(ws, err('invalid'));
@@ -209,6 +264,15 @@ export function startServer(opts: StartOptions): RelayHandle {
         }
         const camId = cameraByRoom.get(msg.code);
         if (camId !== undefined) {
+          // Task 14: a DIFFERENT socket than the one issuing this stop-camera
+          // may still be bound as the room's camera — e.g. a reconnected
+          // camera stops the room from a fresh socket (see the doc above)
+          // while its stale prior socket is still bound. That stale socket
+          // previously went silently unbound with no signal at all; tell it
+          // room-closed too, same courtesy as evicted viewers, before
+          // clearing its binding. The socket issuing the stop already knows
+          // (it just asked for this) and needs no self-notification.
+          if (camId !== ws.data.peerId) sendTo(camId, { type: 'room-closed' });
           unbind(camId);
           cameraByRoom.delete(msg.code);
         }
@@ -325,10 +389,10 @@ export function startServer(opts: StartOptions): RelayHandle {
       if (url.pathname === '/ws') {
         const upgraded = srv.upgrade(req, { data: { peerId: crypto.randomUUID() } });
         if (upgraded) return undefined;
-        return new Response('websocket upgrade required', { status: 400 });
+        return withCsp(new Response('websocket upgrade required', { status: 400 }));
       }
-      if (url.pathname === '/healthz') return new Response('ok');
-      return serveStatic(url.pathname);
+      if (url.pathname === '/healthz') return withCsp(new Response('ok'));
+      return serveStatic(url.pathname).then(withCsp);
     },
     websocket,
   });

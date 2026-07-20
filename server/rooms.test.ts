@@ -9,6 +9,7 @@ import { describe, expect, test } from 'bun:test';
 import { CODE_ALPHABET, CODE_LENGTH } from '../shared/protocol.ts';
 import {
   GRACE_MS,
+  MAX_ROOMS,
   MAX_VIEWERS,
   RATE_LIMIT_MAX_FAILURES,
   RATE_LIMIT_WINDOW_MS,
@@ -27,6 +28,19 @@ function setup(start = 1_000_000) {
   };
 }
 
+/**
+ * createRoom() now returns a Result (Task 14: refusable once MAX_ROOMS is
+ * hit) — this unwraps the common "I just want a fresh room" case used by
+ * the overwhelming majority of tests below, which don't care about the cap.
+ * Throws (fails the test loudly) on the unexpected-refusal branch rather
+ * than silently returning undefined fields.
+ */
+function makeRoom(rm: RoomManager): { code: string; cameraToken: string } {
+  const res = rm.createRoom();
+  if (!res.ok) throw new Error(`createRoom unexpectedly refused: ${res.reason}`);
+  return res;
+}
+
 const codeRe = new RegExp(`^[${CODE_ALPHABET}]{${CODE_LENGTH}}$`);
 const tokenRe = /^[0-9a-f]{32}$/;
 
@@ -40,7 +54,7 @@ describe('constants', () => {
 describe('createRoom', () => {
   test('returns a well-formed code and camera token; camera present', () => {
     const { rm } = setup();
-    const { code, cameraToken } = rm.createRoom();
+    const { code, cameraToken } = makeRoom(rm);
     expect(code).toMatch(codeRe);
     expect(cameraToken).toMatch(tokenRe);
     expect(rm.hasRoom(code)).toBe(true);
@@ -52,7 +66,7 @@ describe('createRoom', () => {
   test('codes are unique across many rooms', () => {
     const { rm } = setup();
     const codes = new Set<string>();
-    for (let i = 0; i < 50; i++) codes.add(rm.createRoom().code);
+    for (let i = 0; i < 50; i++) codes.add(makeRoom(rm).code);
     expect(codes.size).toBe(50);
   });
 });
@@ -60,7 +74,7 @@ describe('createRoom', () => {
 describe('joinRoom', () => {
   test('viewer joins a live room and is listed', () => {
     const { rm } = setup();
-    const { code } = rm.createRoom();
+    const { code } = makeRoom(rm);
     const res = rm.joinRoom(code, 'v1', 'conn-1');
     expect(res).toEqual({ ok: true, cameraPresent: true });
     expect(rm.viewers(code)).toEqual(['v1']);
@@ -76,7 +90,7 @@ describe('joinRoom', () => {
 
   test('hard cap 3 viewers: 4th join → room-full', () => {
     const { rm } = setup();
-    const { code } = rm.createRoom();
+    const { code } = makeRoom(rm);
     for (let i = 1; i <= MAX_VIEWERS; i++) {
       expect(rm.joinRoom(code, `v${i}`, `conn-${i}`)).toEqual({
         ok: true,
@@ -92,7 +106,7 @@ describe('joinRoom', () => {
 
   test('a viewer slot frees up when a viewer leaves', () => {
     const { rm } = setup();
-    const { code } = rm.createRoom();
+    const { code } = makeRoom(rm);
     rm.joinRoom(code, 'v1', 'conn-1');
     rm.joinRoom(code, 'v2', 'conn-2');
     rm.joinRoom(code, 'v3', 'conn-3');
@@ -106,14 +120,14 @@ describe('joinRoom', () => {
 
   test('viewerLeft on unknown room or viewer → false, no throw', () => {
     const { rm } = setup();
-    const { code } = rm.createRoom();
+    const { code } = makeRoom(rm);
     expect(rm.viewerLeft('ZZZZZZZZ', 'v1')).toBe(false);
     expect(rm.viewerLeft(code, 'ghost')).toBe(false);
   });
 
   test('new viewers MAY join an orphaned room (they see the DOWN state)', () => {
     const { rm } = setup();
-    const { code } = rm.createRoom();
+    const { code } = makeRoom(rm);
     rm.cameraDisconnected(code);
     const res = rm.joinRoom(code, 'v1', 'conn-1');
     expect(res).toEqual({ ok: true, cameraPresent: false });
@@ -124,7 +138,7 @@ describe('joinRoom', () => {
 describe('spec: camera disconnect does NOT kill the room — orphaned grace state', () => {
   test('cameraDisconnected → orphaned; viewers stay joined', () => {
     const { rm } = setup();
-    const { code } = rm.createRoom();
+    const { code } = makeRoom(rm);
     rm.joinRoom(code, 'v1', 'conn-1');
     rm.joinRoom(code, 'v2', 'conn-2');
 
@@ -145,12 +159,12 @@ describe('spec: camera disconnect does NOT kill the room — orphaned grace stat
 describe('spec: camera re-claims its room by presenting code + camera token', () => {
   test('reclaim within 10 min → camera present again, orphan cleared, viewers untouched', () => {
     const { rm, advance } = setup();
-    const { code, cameraToken } = rm.createRoom();
+    const { code, cameraToken } = makeRoom(rm);
     rm.joinRoom(code, 'v1', 'conn-1');
     rm.cameraDisconnected(code);
     advance(GRACE_MS - 1);
 
-    expect(rm.reclaimRoom(code, cameraToken)).toEqual({ ok: true });
+    expect(rm.reclaimRoom(code, cameraToken, 'cam-1')).toEqual({ ok: true });
     expect(rm.cameraPresent(code)).toBe(true);
     expect(rm.isOrphaned(code)).toBe(false);
     expect(rm.viewers(code)).toEqual(['v1']);
@@ -158,10 +172,10 @@ describe('spec: camera re-claims its room by presenting code + camera token', ()
 
   test('reclaim cancels the grace timer: room survives past 10 min after reclaim', () => {
     const { rm, advance } = setup();
-    const { code, cameraToken } = rm.createRoom();
+    const { code, cameraToken } = makeRoom(rm);
     rm.cameraDisconnected(code);
     advance(GRACE_MS - 1);
-    rm.reclaimRoom(code, cameraToken);
+    rm.reclaimRoom(code, cameraToken, 'cam-1');
 
     advance(GRACE_MS * 2);
     expect(rm.sweep()).toEqual([]);
@@ -170,10 +184,10 @@ describe('spec: camera re-claims its room by presenting code + camera token', ()
 
   test('wrong token → bad-token; room stays orphaned', () => {
     const { rm } = setup();
-    const { code } = rm.createRoom();
+    const { code } = makeRoom(rm);
     rm.cameraDisconnected(code);
 
-    expect(rm.reclaimRoom(code, 'deadbeefdeadbeefdeadbeefdeadbeef')).toEqual({
+    expect(rm.reclaimRoom(code, 'deadbeefdeadbeefdeadbeefdeadbeef', 'cam-1')).toEqual({
       ok: false,
       reason: 'bad-token',
     });
@@ -182,7 +196,7 @@ describe('spec: camera re-claims its room by presenting code + camera token', ()
 
   test('unknown code → bad-code', () => {
     const { rm } = setup();
-    expect(rm.reclaimRoom('ZZZZZZZZ', 'deadbeefdeadbeefdeadbeefdeadbeef')).toEqual({
+    expect(rm.reclaimRoom('ZZZZZZZZ', 'deadbeefdeadbeefdeadbeefdeadbeef', 'cam-1')).toEqual({
       ok: false,
       reason: 'bad-code',
     });
@@ -192,7 +206,7 @@ describe('spec: camera re-claims its room by presenting code + camera token', ()
 describe('spec: grace-period expiry destroys the room and its code', () => {
   test('sweep before expiry destroys nothing', () => {
     const { rm, advance } = setup();
-    const { code } = rm.createRoom();
+    const { code } = makeRoom(rm);
     rm.cameraDisconnected(code);
     advance(GRACE_MS - 1);
 
@@ -202,7 +216,7 @@ describe('spec: grace-period expiry destroys the room and its code', () => {
 
   test('advance 10 min + sweep → room destroyed; viewer snapshot returned; joinRoom now bad-code', () => {
     const { rm, advance } = setup();
-    const { code } = rm.createRoom();
+    const { code } = makeRoom(rm);
     rm.joinRoom(code, 'v1', 'conn-1');
     rm.cameraDisconnected(code);
     advance(GRACE_MS);
@@ -217,9 +231,9 @@ describe('spec: grace-period expiry destroys the room and its code', () => {
 
   test('sweep only destroys orphaned rooms whose grace expired', () => {
     const { rm, advance } = setup();
-    const live = rm.createRoom().code;
-    const orphanFresh = rm.createRoom().code;
-    const orphanStale = rm.createRoom().code;
+    const live = makeRoom(rm).code;
+    const orphanFresh = makeRoom(rm).code;
+    const orphanStale = makeRoom(rm).code;
 
     rm.cameraDisconnected(orphanStale);
     advance(GRACE_MS);
@@ -235,7 +249,7 @@ describe('spec: grace-period expiry destroys the room and its code', () => {
     // The post-grace-pre-sweep window is real product behavior (the server
     // sweeps on an interval); methods must NOT expire rooms lazily per call.
     const { rm, advance } = setup();
-    const { code } = rm.createRoom();
+    const { code } = makeRoom(rm);
     rm.cameraDisconnected(code);
     advance(GRACE_MS + 5_000); // well past grace, but no sweep yet
 
@@ -251,11 +265,11 @@ describe('spec: grace-period expiry destroys the room and its code', () => {
 
   test('expiry is sweep-driven: reclaim in the post-grace-pre-sweep window still succeeds', () => {
     const { rm, advance } = setup();
-    const { code, cameraToken } = rm.createRoom();
+    const { code, cameraToken } = makeRoom(rm);
     rm.cameraDisconnected(code);
     advance(GRACE_MS + 5_000); // past grace, no sweep yet
 
-    expect(rm.reclaimRoom(code, cameraToken)).toEqual({ ok: true });
+    expect(rm.reclaimRoom(code, cameraToken, 'cam-1')).toEqual({ ok: true });
     // Reclaim cleared the orphan state, so the sweep no longer destroys it.
     expect(rm.sweep()).toEqual([]);
     expect(rm.hasRoom(code)).toBe(true);
@@ -264,12 +278,12 @@ describe('spec: grace-period expiry destroys the room and its code', () => {
 
   test('reclaim after expiry + sweep → bad-code', () => {
     const { rm, advance } = setup();
-    const { code, cameraToken } = rm.createRoom();
+    const { code, cameraToken } = makeRoom(rm);
     rm.cameraDisconnected(code);
     advance(GRACE_MS);
     rm.sweep();
 
-    expect(rm.reclaimRoom(code, cameraToken)).toEqual({
+    expect(rm.reclaimRoom(code, cameraToken, 'cam-1')).toEqual({
       ok: false,
       reason: 'bad-code',
     });
@@ -279,7 +293,7 @@ describe('spec: grace-period expiry destroys the room and its code', () => {
 describe('spec: only an explicit "Stop camera" action destroys the room immediately', () => {
   test('stopCamera with the right token → immediate destroy; evicted viewer ids returned', () => {
     const { rm } = setup();
-    const { code, cameraToken } = rm.createRoom();
+    const { code, cameraToken } = makeRoom(rm);
     rm.joinRoom(code, 'v1', 'conn-1');
     rm.joinRoom(code, 'v2', 'conn-2');
 
@@ -293,13 +307,13 @@ describe('spec: only an explicit "Stop camera" action destroys the room immediat
 
   test('stopCamera with no viewers → empty eviction list', () => {
     const { rm } = setup();
-    const { code, cameraToken } = rm.createRoom();
+    const { code, cameraToken } = makeRoom(rm);
     expect(rm.stopCamera(code, cameraToken)).toEqual({ ok: true, viewers: [] });
   });
 
   test('wrong token → bad-token; room survives', () => {
     const { rm } = setup();
-    const { code } = rm.createRoom();
+    const { code } = makeRoom(rm);
     expect(rm.stopCamera(code, 'deadbeefdeadbeefdeadbeefdeadbeef')).toEqual({
       ok: false,
       reason: 'bad-token',
@@ -333,7 +347,7 @@ describe('spec: after a restart, a camera may re-create a room with its previous
   test('recreateRoom issues a token different from the one issued before', () => {
     const { rm } = setup();
     const a = new RoomManager(() => 0);
-    const { code, cameraToken: oldToken } = a.createRoom(); // "before restart"
+    const { code, cameraToken: oldToken } = makeRoom(a); // "before restart"
     const res = rm.recreateRoom(code, 'cam-1'); // fresh manager = restarted server
     expect(res.ok).toBe(true);
     if (!res.ok) throw new Error('unreachable');
@@ -342,13 +356,13 @@ describe('spec: after a restart, a camera may re-create a room with its previous
 
   test('recreateRoom when the room exists (live) → bad-code: cannot hijack', () => {
     const { rm } = setup();
-    const { code } = rm.createRoom();
+    const { code } = makeRoom(rm);
     expect(rm.recreateRoom(code, 'cam-1')).toEqual({ ok: false, reason: 'bad-code' });
   });
 
   test('recreateRoom when the room exists (orphaned, in grace) → bad-code', () => {
     const { rm } = setup();
-    const { code } = rm.createRoom();
+    const { code } = makeRoom(rm);
     rm.cameraDisconnected(code);
     // During grace only the token holder may take the room back.
     expect(rm.recreateRoom(code, 'cam-1')).toEqual({ ok: false, reason: 'bad-code' });
@@ -367,12 +381,12 @@ describe('spec: after a restart, a camera may re-create a room with its previous
 describe('edge: camera that lost its token cannot reclaim; must wait out grace then recreate', () => {
   test('full sequence: bad-token → recreate blocked during grace → expiry → recreate with fresh token', () => {
     const { rm, advance } = setup();
-    const { code, cameraToken } = rm.createRoom();
+    const { code, cameraToken } = makeRoom(rm);
     rm.joinRoom(code, 'v1', 'conn-1');
     rm.cameraDisconnected(code);
 
     // Lost token: reclaim fails.
-    expect(rm.reclaimRoom(code, 'deadbeefdeadbeefdeadbeefdeadbeef')).toEqual({
+    expect(rm.reclaimRoom(code, 'deadbeefdeadbeefdeadbeefdeadbeef', 'cam-1')).toEqual({
       ok: false,
       reason: 'bad-token',
     });
@@ -415,7 +429,7 @@ describe('rate limiting: failed joins per connection id (sliding 60 s window)', 
 
   test('a rate-limited connection cannot join even with a valid code', () => {
     const { rm } = setup();
-    const { code } = rm.createRoom();
+    const { code } = makeRoom(rm);
     for (let i = 0; i < RATE_LIMIT_MAX_FAILURES; i++) {
       rm.joinRoom('ZZZZZZZZ', `v${i}`, 'conn-1');
     }
@@ -428,7 +442,7 @@ describe('rate limiting: failed joins per connection id (sliding 60 s window)', 
 
   test('limit is per connection id: other connections are unaffected', () => {
     const { rm } = setup();
-    const { code } = rm.createRoom();
+    const { code } = makeRoom(rm);
     for (let i = 0; i < RATE_LIMIT_MAX_FAILURES + 1; i++) {
       rm.joinRoom('ZZZZZZZZ', `v${i}`, 'conn-1');
     }
@@ -452,7 +466,7 @@ describe('rate limiting: failed joins per connection id (sliding 60 s window)', 
 
   test('successful joins are not counted as failures', () => {
     const { rm } = setup();
-    const { code } = rm.createRoom();
+    const { code } = makeRoom(rm);
     for (let i = 0; i < RATE_LIMIT_MAX_FAILURES; i++) {
       const res = rm.joinRoom(code, `v${i}`, 'conn-1');
       expect(res.ok).toBe(true);
@@ -467,7 +481,7 @@ describe('rate limiting: failed joins per connection id (sliding 60 s window)', 
 
   test('failed recreateRoom attempts are rate-limited too (no room-existence oracle)', () => {
     const { rm } = setup();
-    const { code } = rm.createRoom(); // live room an attacker probes for
+    const { code } = makeRoom(rm); // live room an attacker probes for
     for (let i = 0; i < RATE_LIMIT_MAX_FAILURES; i++) {
       expect(rm.recreateRoom(code, 'conn-1')).toEqual({
         ok: false,
@@ -491,7 +505,7 @@ describe('rate limiting: failed joins per connection id (sliding 60 s window)', 
   test('failed joins and failed recreates share one per-connection window', () => {
     const { rm } = setup();
     // Live room: recreating it fails with bad-code and must count.
-    const { code } = rm.createRoom();
+    const { code } = makeRoom(rm);
     for (let i = 0; i < 5; i++) {
       expect(rm.joinRoom('ZZZZZZZZ', `v${i}`, 'conn-1').ok).toBe(false);
       expect(rm.recreateRoom(code, 'conn-1').ok).toBe(false);
@@ -526,5 +540,123 @@ describe('rate limiting: failed joins per connection id (sliding 60 s window)', 
     advance(RATE_LIMIT_WINDOW_MS);
     rm.sweep();
     expect(rm.trackedConnections()).toBe(0);
+  });
+
+  // -- Task 14: reclaimRoom joins the shared rate limiter -------------------
+
+  test('more than 10 failed reclaims (bad-code) within 60 s → rate-limited', () => {
+    const { rm } = setup();
+    for (let i = 0; i < RATE_LIMIT_MAX_FAILURES; i++) {
+      expect(rm.reclaimRoom('ZZZZZZZZ', 'deadbeefdeadbeefdeadbeefdeadbeef', 'cam-1')).toEqual({
+        ok: false,
+        reason: 'bad-code',
+      });
+    }
+    expect(rm.reclaimRoom('ZZZZZZZZ', 'deadbeefdeadbeefdeadbeefdeadbeef', 'cam-1')).toEqual({
+      ok: false,
+      reason: 'rate-limited',
+    });
+  });
+
+  test('more than 10 failed reclaims (bad-token, room exists) within 60 s → rate-limited', () => {
+    const { rm } = setup();
+    const { code, cameraToken } = makeRoom(rm);
+    for (let i = 0; i < RATE_LIMIT_MAX_FAILURES; i++) {
+      expect(rm.reclaimRoom(code, 'deadbeefdeadbeefdeadbeefdeadbeef', 'cam-1')).toEqual({
+        ok: false,
+        reason: 'bad-token',
+      });
+    }
+    expect(rm.reclaimRoom(code, 'deadbeefdeadbeefdeadbeefdeadbeef', 'cam-1')).toEqual({
+      ok: false,
+      reason: 'rate-limited',
+    });
+    // Even the RIGHT token is refused while limited — otherwise the window
+    // would be trivially bypassable by finally guessing correctly.
+    expect(rm.reclaimRoom(code, cameraToken, 'cam-1')).toEqual({
+      ok: false,
+      reason: 'rate-limited',
+    });
+  });
+
+  test('successful reclaims are never counted as failures', () => {
+    const { rm } = setup();
+    const { code, cameraToken } = makeRoom(rm);
+    for (let i = 0; i < RATE_LIMIT_MAX_FAILURES; i++) {
+      rm.cameraDisconnected(code);
+      expect(rm.reclaimRoom(code, cameraToken, 'cam-1')).toEqual({ ok: true });
+    }
+    expect(rm.trackedConnections()).toBe(0);
+  });
+
+  test('failed joins, recreates, and reclaims all share one per-connection window', () => {
+    const { rm } = setup();
+    const { code, cameraToken } = makeRoom(rm);
+    rm.cameraDisconnected(code);
+    // 4 bad joins + 3 bad recreates + 3 bad reclaims = 10 failures, all on
+    // the same connection id.
+    for (let i = 0; i < 4; i++) {
+      expect(rm.joinRoom('ZZZZZZZZ', `v${i}`, 'conn-1').ok).toBe(false);
+    }
+    for (let i = 0; i < 3; i++) {
+      expect(rm.recreateRoom(code, 'conn-1').ok).toBe(false); // room is live: bad-code
+    }
+    for (let i = 0; i < 3; i++) {
+      expect(
+        rm.reclaimRoom(code, 'deadbeefdeadbeefdeadbeefdeadbeef', 'conn-1').ok,
+      ).toBe(false); // bad-token
+    }
+    // 10th failure landed; the 11th attempt on ANY of the three paths is
+    // rate-limited, including a reclaim with the CORRECT token.
+    expect(rm.reclaimRoom(code, cameraToken, 'conn-1')).toEqual({
+      ok: false,
+      reason: 'rate-limited',
+    });
+  });
+});
+
+// -- Task 14: global MAX_ROOMS cap -------------------------------------------
+
+describe('MAX_ROOMS: global cap on live-or-orphaned rooms', () => {
+  test('constant is 100', () => {
+    expect(MAX_ROOMS).toBe(100);
+  });
+
+  test('createRoom refuses once MAX_ROOMS rooms exist', () => {
+    const { rm } = setup();
+    for (let i = 0; i < MAX_ROOMS; i++) makeRoom(rm);
+    expect(rm.createRoom()).toEqual({ ok: false, reason: 'invalid' });
+  });
+
+  test('a room freed by stopCamera makes room for a new one again', () => {
+    const { rm } = setup();
+    const rooms = Array.from({ length: MAX_ROOMS }, () => makeRoom(rm));
+    expect(rm.createRoom()).toEqual({ ok: false, reason: 'invalid' });
+    const first = rooms[0]!;
+    rm.stopCamera(first.code, first.cameraToken);
+    const res = rm.createRoom();
+    expect(res.ok).toBe(true);
+  });
+
+  test('recreateRoom refuses once MAX_ROOMS rooms exist, even for a brand-new code', () => {
+    const { rm } = setup();
+    for (let i = 0; i < MAX_ROOMS; i++) makeRoom(rm);
+    expect(rm.recreateRoom('ZZZZZZZZ', 'cam-1')).toEqual({ ok: false, reason: 'invalid' });
+  });
+
+  test('recreateRoom cap refusal is NOT counted as a rate-limit failure (it is a capacity condition, not a guess)', () => {
+    const { rm } = setup();
+    for (let i = 0; i < MAX_ROOMS; i++) makeRoom(rm);
+    for (let i = 0; i < RATE_LIMIT_MAX_FAILURES + 5; i++) {
+      expect(rm.recreateRoom('ZZZZZZZZ', 'conn-1')).toEqual({ ok: false, reason: 'invalid' });
+    }
+    expect(rm.trackedConnections()).toBe(0);
+  });
+
+  test('orphaned (grace) rooms still count toward the cap', () => {
+    const { rm } = setup();
+    const rooms = Array.from({ length: MAX_ROOMS }, () => makeRoom(rm));
+    for (const r of rooms) rm.cameraDisconnected(r.code);
+    expect(rm.createRoom()).toEqual({ ok: false, reason: 'invalid' });
   });
 });

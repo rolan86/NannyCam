@@ -29,13 +29,21 @@ const session = new CameraSession({
   location: window.location,
 });
 
-// Test hook (Task 12 e2e), mirroring the viewer hook (src/viewer/main.tsx,
-// same comment style): exposes the full session so Playwright can assert
-// talk-back wiring (onRemoteAudio / a viewer's inbound mic track) from the
-// camera side without reimplementing WebRTC track inspection in the page.
-// Same broad-surface trust-model caveat as the viewer hook — Task 14
-// narrows both before the app reaches any less-trusted context.
-(window as unknown as { __nannycam: CameraSession }).__nannycam = session;
+/**
+ * Test hook (Task 12 e2e), mirroring the viewer hook (src/viewer/main.tsx,
+ * same comment style). Task 14: narrowed from the full session to a
+ * read-only facade — remoteAudioCount() is the one session-level query
+ * worth keeping (e2e/monitor.spec.ts + preflight.spec.ts today assert
+ * talk-back wiring via the DOM's `remote-audio` elements instead, so
+ * nothing currently reaches through this hook, but it's kept minimal and
+ * ready rather than removed outright).
+ */
+interface NannycamCameraHook {
+  remoteAudioCount(): number;
+}
+(window as unknown as { __nannycam: NannycamCameraHook }).__nannycam = {
+  remoteAudioCount: () => session.remoteAudioCount(),
+};
 
 /**
  * Collapsible "Alerts" panel (Task 11): two enable toggles + two sensitivity

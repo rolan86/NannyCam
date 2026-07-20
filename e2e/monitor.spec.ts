@@ -201,18 +201,18 @@ test('camera death alarms viewer, revival auto-recovers', async ({ browser }) =>
 /**
  * Reads the viewer session's acquired mic track's `enabled` flag through the
  * same test-hook pattern as framesDecoded above (window.__nannycam, wired in
- * src/viewer/main.tsx). `micTrack` is a TypeScript-`private` field, but that
- * is a compile-time-only annotation — at runtime it's an ordinary property,
- * and reaching into it here is the most direct way to prove the REAL
- * MediaStreamTrack (not just the session's public talk-state string) flips
- * with press/release, per this test's explicit brief.
+ * src/viewer/main.tsx). Task 14 narrowed the hook to a read-only facade —
+ * micTrackState() — rather than exposing the session (or its private
+ * micTrack field) wholesale; this is the most direct way left to prove the
+ * REAL MediaStreamTrack (not just the session's public talk-state string)
+ * flips with press/release, per this test's explicit brief.
  */
 async function micEnabled(page: Page): Promise<boolean | null> {
   return page.evaluate(() => {
     const win = window as unknown as {
-      __nannycam: { micTrack: MediaStreamTrack | null };
+      __nannycam: { micTrackState(): { enabled: boolean; readyState: string } | null };
     };
-    return win.__nannycam.micTrack?.enabled ?? null;
+    return win.__nannycam.micTrackState()?.enabled ?? null;
   });
 }
 

@@ -311,6 +311,18 @@ export class ViewerSession {
   }
 
   /**
+   * Read-only snapshot of the acquired PTT mic track's live state (Task 14
+   * facade for the e2e test hook — see main.tsx's __nannycam). Null before
+   * any press ever acquires a track (see micTrack's doc). `enabled` mirrors
+   * press/release; `readyState` catches the track having been stopped
+   * (releaseMic()) out from under a stale reference.
+   */
+  micTrackState(): { enabled: boolean; readyState: MediaStreamTrackState } | null {
+    if (this.micTrack === null) return null;
+    return { enabled: this.micTrack.enabled, readyState: this.micTrack.readyState };
+  }
+
+  /**
    * Join a room. The code comes from the argument (input field) or, when
    * absent, from the URL fragment (#CODE); both are uppercase-normalized.
    * Invalid/absent code → stays 'idle' with an error hint so the UI shows

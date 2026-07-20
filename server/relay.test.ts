@@ -16,7 +16,7 @@ import {
   type C2S,
   type S2C,
 } from '../shared/protocol.ts';
-import { GRACE_MS, MAX_VIEWERS, RATE_LIMIT_MAX_FAILURES } from './rooms.ts';
+import { GRACE_MS, MAX_ROOMS, MAX_VIEWERS, RATE_LIMIT_MAX_FAILURES } from './rooms.ts';
 import { startServer, SWEEP_INTERVAL_MS, type RelayHandle } from './main.ts';
 
 const codeRe = new RegExp(`^[${CODE_ALPHABET}]{${CODE_LENGTH}}$`);
@@ -185,6 +185,26 @@ describe('create and join', () => {
     viewer.send({ type: 'join-room', code: 'ZZZZZZZ2' });
     expect(await viewer.next()).toEqual({ type: 'error', reason: 'rate-limited' });
   });
+
+  test('the 11th bad join within the window rate-limits WITHOUT dropping the socket', async () => {
+    const h = boot();
+    const viewer = await connect(h.port);
+    for (let i = 0; i < RATE_LIMIT_MAX_FAILURES; i++) {
+      viewer.send({ type: 'join-room', code: 'ZZZZZZZ2' });
+      expect(await viewer.next()).toEqual({ type: 'error', reason: 'bad-code' });
+    }
+    // 11th attempt: rate-limited, not a socket close.
+    viewer.send({ type: 'join-room', code: 'ZZZZZZZ2' });
+    expect(await viewer.next()).toEqual({ type: 'error', reason: 'rate-limited' });
+    expect(viewer.ws.readyState).toBe(WebSocket.OPEN);
+    // The connection stays fully usable for anything that ISN'T rate-limited
+    // by this window (e.g. a signal on an unrelated concern) — proves the
+    // socket is alive and the relay is still processing its messages, not
+    // just that readyState hasn't flipped yet.
+    viewer.send({ type: 'signal', to: 'nobody', payload: 'x' });
+    expect(await viewer.next()).toEqual({ type: 'error', reason: 'invalid' });
+    expect(viewer.ws.readyState).toBe(WebSocket.OPEN);
+  });
 });
 
 // -- one room per socket ----------------------------------------------------
@@ -299,6 +319,21 @@ describe('malformed input', () => {
     const h = boot();
     const c = await connect(h.port);
     c.ws.send(new Uint8Array([1, 2, 3]));
+    expect(await c.next()).toEqual({ type: 'error', reason: 'invalid' });
+    await c.expectSilence();
+    c.send({ type: 'create-room' });
+    expect((await c.next()).type).toBe('room-created');
+  });
+
+  test('frame of exactly MAX_MESSAGE_BYTES → accepted at the WS layer, connection survives', async () => {
+    // Boundary check on Bun's own maxPayloadLength enforcement (not
+    // parseMessage's byte check, already covered at the unit level in
+    // shared/protocol.test.ts) — the raw frame is 'a'.repeat(N), which is
+    // not valid JSON, so the relay answers error:invalid; the point here is
+    // that the connection is NOT dropped for a frame exactly at the cap.
+    const h = boot();
+    const c = await connect(h.port);
+    c.sendRaw('a'.repeat(MAX_MESSAGE_BYTES));
     expect(await c.next()).toEqual({ type: 'error', reason: 'invalid' });
     await c.expectSilence();
     c.send({ type: 'create-room' });
@@ -432,6 +467,21 @@ describe('camera disconnect and reclaim', () => {
     const { viewerId } = await joinRoom(h.port, code);
     expect(await cam2.next()).toEqual({ type: 'peer-joined', peerId: viewerId });
   });
+
+  // Task 14: reclaimRoom failures are rate-limited on the same connection id
+  // as join/recreate — see rooms.ts's reclaimRoom doc for why (unthrottled,
+  // it was both a room-existence AND camera-token oracle).
+  test('repeated failed reclaims (bad-token) on one socket → rate-limited', async () => {
+    const h = boot();
+    const { code } = await createRoom(h.port);
+    const attacker = await connect(h.port);
+    for (let i = 0; i < RATE_LIMIT_MAX_FAILURES; i++) {
+      attacker.send({ type: 'reclaim-room', code, cameraToken: 'f'.repeat(32) });
+      expect(await attacker.next()).toEqual({ type: 'error', reason: 'bad-token' });
+    }
+    attacker.send({ type: 'reclaim-room', code, cameraToken: 'f'.repeat(32) });
+    expect(await attacker.next()).toEqual({ type: 'error', reason: 'rate-limited' });
+  });
 });
 
 // -- recreate after server restart ------------------------------------------
@@ -518,6 +568,10 @@ describe('stop-camera', () => {
     const fresh = await connect(h.port);
     fresh.send({ type: 'stop-camera', code, cameraToken: token });
     expect(await viewer.next()).toEqual({ type: 'room-closed' });
+    // Task 14: the OLD camera socket is still bound (never reclaimed) — it
+    // gets the same room-closed courtesy as an evicted viewer, from a
+    // DIFFERENT socket stopping its room.
+    expect(await cam.next()).toEqual({ type: 'room-closed' });
     // Room and code are gone; the old camera binding was cleared.
     const probe = await connect(h.port);
     probe.send({ type: 'join-room', code });
@@ -577,6 +631,20 @@ describe('grace expiry', () => {
   });
 });
 
+// -- global room cap ----------------------------------------------------------
+
+describe('MAX_ROOMS: global cap, wired end-to-end', () => {
+  test('the (MAX_ROOMS + 1)th create-room, from a fresh unbound socket, gets error invalid', async () => {
+    const h = boot();
+    // MAX_ROOMS distinct sockets, each successfully opening one room —
+    // one-room-per-socket means a single socket can't be used to probe this.
+    for (let i = 0; i < MAX_ROOMS; i++) await createRoom(h.port);
+    const overflow = await connect(h.port);
+    overflow.send({ type: 'create-room' });
+    expect(await overflow.next()).toEqual({ type: 'error', reason: 'invalid' });
+  });
+});
+
 // -- HTTP layer -------------------------------------------------------------
 
 describe('static file serving', () => {
@@ -621,5 +689,33 @@ describe('static file serving', () => {
     const h = boot();
     const res = await fetch(`http://127.0.0.1:${h.port}/ws`);
     expect(res.status).toBe(400);
+  });
+});
+
+// -- CSP -----------------------------------------------------------------
+
+describe('Content-Security-Policy', () => {
+  const csp =
+    "default-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self' wss: ws:";
+
+  function bootWithDist(): RelayHandle {
+    const dir = mkdtempSync(join(tmpdir(), 'nannycam-dist-csp-'));
+    tempDirs.push(dir);
+    writeFileSync(join(dir, 'index.html'), '<h1>nannycam home</h1>');
+    return boot({ distDir: dir });
+  }
+
+  test('every HTTP response carries the CSP header, including 200s, 404s, and the /ws 400', async () => {
+    const h = bootWithDist();
+    const cases = [
+      `http://127.0.0.1:${h.port}/`,
+      `http://127.0.0.1:${h.port}/missing.js`,
+      `http://127.0.0.1:${h.port}/healthz`,
+      `http://127.0.0.1:${h.port}/ws`,
+    ];
+    for (const url of cases) {
+      const res = await fetch(url);
+      expect(res.headers.get('Content-Security-Policy')).toBe(csp);
+    }
   });
 });

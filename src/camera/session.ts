@@ -705,6 +705,18 @@ export class CameraSession {
 
   // -- talk-back (Task 12) -----------------------------------------------
 
+  /**
+   * Read-only count of currently-active inbound PTT audio streams (Task 14
+   * facade for the e2e test hook — see main.tsx's __nannycam). Mirrors what
+   * e2e/monitor.spec.ts already asserts via the DOM (`remote-audio`
+   * elements rendered one-per-entry — see RemoteAudioSinks in main.tsx);
+   * exposed here too as the minimal session-level read surface in case a
+   * future test wants it without walking the DOM.
+   */
+  remoteAudioCount(): number {
+    return this.remoteAudio.size;
+  }
+
   private remoteAudioEntries(): RemoteAudioEntry[] {
     return [...this.remoteAudio.entries()].map(([peerId, stream]) => ({ peerId, stream }));
   }

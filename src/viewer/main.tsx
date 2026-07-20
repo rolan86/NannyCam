@@ -27,14 +27,24 @@ const session = new ViewerSession({
 });
 const monitor = new ViewerMonitor({ session });
 
-// Test hook (Task 9 e2e, still used by Task 10's monitor.spec.ts): exposes
-// the full session so Playwright can drive getStats() (framesDecoded)
-// without reimplementing WebRTC stats polling in the page. This is the FULL
-// session for now — a broad, read-mostly surface acceptable for the current
-// trust model where only local Playwright tests reach it; Task 14 (security
-// hardening) narrows this to a purpose-built stats facade before the app is
-// exposed to any less-trusted context.
-(window as unknown as { __nannycam: ViewerSession }).__nannycam = session;
+/**
+ * Test hook (Task 9 e2e, still used by Task 10's monitor.spec.ts). Task 14:
+ * narrowed from exposing the FULL session (broad, read-mostly, but still a
+ * live window into private internals) to exactly the two read-only queries
+ * e2e/monitor.spec.ts drives — getStats() for framesDecoded polling, and
+ * micTrackState() for the PTT press/release assertions (previously reached
+ * via a `.micTrack` private-field cast directly in the test file — see this
+ * file's git history / the Task 12 e2e report). No method here can mutate
+ * session state.
+ */
+interface NannycamViewerHook {
+  getStats(): Promise<RTCStatsReport | null>;
+  micTrackState(): { enabled: boolean; readyState: MediaStreamTrackState } | null;
+}
+(window as unknown as { __nannycam: NannycamViewerHook }).__nannycam = {
+  getStats: () => session.getStats(),
+  micTrackState: () => session.micTrackState(),
+};
 
 /** Human-readable status line: phase + camera presence (Task 9 asserts it). */
 function statusText(state: ViewerState): string {

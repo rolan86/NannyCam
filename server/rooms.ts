@@ -28,6 +28,7 @@
 // extend the window. Limiter state is pruned lazily on each check and
 // globally in sweep().
 
+import { timingSafeEqual } from 'node:crypto';
 import {
   CODE_ALPHABET,
   CODE_LENGTH,
@@ -40,6 +41,17 @@ export const GRACE_MS = 10 * 60 * 1000;
 export const MAX_VIEWERS = 3;
 export const RATE_LIMIT_MAX_FAILURES = 10;
 export const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+/**
+ * Task 14: global cap on simultaneously live-or-orphaned rooms — a second
+ * belt-and-suspenders limit on top of one-room-per-socket (server/main.ts),
+ * which only bounds hostile room-minting by CONNECTION count, not by total
+ * server memory. Reusing the 'invalid' reason rather than adding an eighth
+ * ErrorReason variant: a dedicated reason (e.g. 'server-full') would widen
+ * the wire protocol for a condition that should essentially never fire in
+ * normal operation (100 concurrent rooms on a tailnet-scale deployment), and
+ * the client has no different recovery to offer either way.
+ */
+export const MAX_ROOMS = 100;
 
 export type Result<T = object> = ({ ok: true } & T) | { ok: false; reason: ErrorReason };
 
@@ -68,8 +80,14 @@ export class RoomManager {
 
   constructor(private readonly now: () => number) {}
 
-  /** Camera opens a brand-new room. Codes are unique among live rooms. */
-  createRoom(): { code: string; cameraToken: string } {
+  /**
+   * Camera opens a brand-new room. Codes are unique among live rooms.
+   * Refused once MAX_ROOMS rooms are live-or-orphaned (see its doc) — the
+   * server-side caller (server/main.ts) already refuses a second room per
+   * socket, so this is the global backstop, not the primary defense.
+   */
+  createRoom(): Result<{ code: string; cameraToken: string }> {
+    if (this.rooms.size >= MAX_ROOMS) return { ok: false, reason: 'invalid' };
     let code = generateCode();
     while (this.rooms.has(code)) code = generateCode(); // collision: re-draw
     const cameraToken = generateToken();
@@ -80,7 +98,7 @@ export class RoomManager {
       orphanedAt: null,
       viewers: new Map(),
     });
-    return { code, cameraToken };
+    return { ok: true, code, cameraToken };
   }
 
   /**
@@ -95,6 +113,14 @@ export class RoomManager {
     if (this.isRateLimited(connectionId)) {
       return { ok: false, reason: 'rate-limited' };
     }
+    // Cap check BEFORE code validity/existence: at capacity every recreate
+    // is refused the same way regardless of the code presented, so a
+    // full server leaks nothing about whether any particular code exists
+    // (same room-existence-oracle concern the rate limiter itself guards).
+    // Deliberately NOT routed through recordFailure — this is a capacity
+    // condition, not a guessing attempt, and must not tighten the caller's
+    // rate-limit window for a class of failure entirely outside its control.
+    if (this.rooms.size >= MAX_ROOMS) return { ok: false, reason: 'invalid' };
     if (!isValidCode(code) || this.rooms.has(code)) {
       return this.recordFailure(connectionId, 'bad-code');
     }
@@ -147,11 +173,24 @@ export class RoomManager {
    * viewers are untouched. Allowed even while the camera is still marked
    * present (its disconnect may not have been observed yet); the server
    * replaces the stale camera socket (Task 4).
+   *
+   * Task 14: failed attempts (bad-code AND bad-token) share the same
+   * per-connection rate limit as join/recreate. Before this, reclaim was an
+   * unthrottled oracle for two things an attacker could otherwise only
+   * guess at a limited rate: room existence (bad-code) AND, for a room known
+   * to exist, the camera token itself (bad-token) — a 128-bit token is safe
+   * against brute force only because guesses cost something. Successes are
+   * never recorded, same convention as joinRoom/recreateRoom.
    */
-  reclaimRoom(code: string, cameraToken: string): Result {
+  reclaimRoom(code: string, cameraToken: string, connectionId: string): Result {
+    if (this.isRateLimited(connectionId)) {
+      return { ok: false, reason: 'rate-limited' };
+    }
     const room = this.rooms.get(code);
-    if (!room) return { ok: false, reason: 'bad-code' };
-    if (!this.tokenMatches(room, cameraToken)) return { ok: false, reason: 'bad-token' };
+    if (!room) return this.recordFailure(connectionId, 'bad-code');
+    if (!this.tokenMatches(room, cameraToken)) {
+      return this.recordFailure(connectionId, 'bad-token');
+    }
     room.cameraPresent = true;
     room.orphanedAt = null;
     return { ok: true };
@@ -223,10 +262,19 @@ export class RoomManager {
 
   /**
    * Single comparison site for camera-token checks (reclaimRoom, stopCamera).
-   * Task 14 (security hardening) can swap this for a constant-time compare.
+   * Constant-time (crypto.timingSafeEqual, available in Bun via node:crypto)
+   * so a network attacker who can measure response latency can't use a
+   * naive `===` short-circuit to recover the token byte-by-byte. Buffer
+   * lengths must match before calling timingSafeEqual (it throws on a
+   * mismatch) — the expected length (32 hex chars, generateToken's fixed
+   * output) is already public per the wire protocol, so a length-mismatch
+   * short-circuit here leaks nothing an attacker doesn't already know.
    */
   private tokenMatches(room: Room, cameraToken: string): boolean {
-    return cameraToken === room.cameraToken;
+    const expected = Buffer.from(room.cameraToken, 'utf8');
+    const actual = Buffer.from(cameraToken, 'utf8');
+    if (expected.length !== actual.length) return false;
+    return timingSafeEqual(expected, actual);
   }
 
   /** Drop failure timestamps that fell out of the sliding window. */
