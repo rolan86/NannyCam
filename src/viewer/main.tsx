@@ -388,7 +388,11 @@ function App() {
       screen = (
         <main class="center" data-testid="ended-screen">
           <h1>Session ended</h1>
-          <p class="calm">The camera stopped sharing.</p>
+          <p class="calm" data-testid="ended-copy">
+            {state.endedReason === 'lost'
+              ? 'Camera lost — the connection ended and did not recover.'
+              : 'The camera stopped sharing.'}
+          </p>
           <button
             class="primary"
             data-testid="rejoin-btn"

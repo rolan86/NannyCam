@@ -494,6 +494,37 @@ describe('camera lifecycle', () => {
     expect(h.last()).toMatchObject({ phase: 'ended', cameraPresent: false });
   });
 
+  // Review fix: the server sends room-closed for TWO different reasons —
+  // (a) an explicit "Stop camera" while the viewer was live, and (b) grace-
+  // period expiry after the camera vanished unintentionally (peer-left
+  // already fired earlier, well before this room-closed). The viewer's OWN
+  // cameraPresent flag at the moment room-closed arrives distinguishes them:
+  // still true → we were live/deliberate stop; already false → the camera
+  // was already known-gone (a real death), and this room-closed is just the
+  // grace-expiry follow-up — a different, more honest copy is owed.
+  test('room-closed while live (deliberate stop) → endedReason "stopped"', () => {
+    const h = live();
+    expect(h.last().cameraPresent).toBe(true);
+    h.signaling.receive({ type: 'room-closed' });
+    expect(h.last()).toMatchObject({
+      phase: 'ended',
+      cameraPresent: false,
+      endedReason: 'stopped',
+    });
+  });
+
+  test('room-closed after the camera already vanished (peer-left first, grace expiry) → endedReason "lost"', () => {
+    const h = live();
+    h.signaling.receive({ type: 'peer-left', peerId: 'cam-1' }); // camera died; grace period begins
+    expect(h.last().cameraPresent).toBe(false);
+    h.signaling.receive({ type: 'room-closed' }); // grace expired
+    expect(h.last()).toMatchObject({
+      phase: 'ended',
+      cameraPresent: false,
+      endedReason: 'lost',
+    });
+  });
+
   test('room-joined outside joining (hostile relay) resets peer + stream first', () => {
     const h = live();
     h.signaling.receive(ROOM_JOINED);

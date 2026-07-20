@@ -52,6 +52,16 @@ export interface ViewerState {
   /** Push-to-talk state — see TalkState. */
   talk: TalkState;
   error?: string;
+  /**
+   * Set only when phase === 'ended' (i.e. on room-closed — see its handler):
+   * distinguishes a deliberate "Stop camera" ('stopped') from a room-closed
+   * that arrived after the camera was already known-gone ('lost' — grace
+   * expiry following an unintentional death, e.g. a crash or dead battery).
+   * The server sends room-closed for both cases with no wire-level
+   * distinction; this is derived client-side from cameraPresent at the
+   * moment room-closed arrives (see the handler). Undefined outside 'ended'.
+   */
+  endedReason?: 'stopped' | 'lost';
 }
 
 /** The slice of SignalingClient the session uses (mockable in tests). */
@@ -355,6 +365,7 @@ export class ViewerSession {
       roomCode: normalized,
       cameraPresent: false,
       error: undefined,
+      endedReason: undefined,
     });
     this.signaling.send({ type: 'join-room', code: normalized });
   }
@@ -544,6 +555,7 @@ export class ViewerSession {
       cameraPresent: false,
       error: undefined,
       talk: 'idle',
+      endedReason: undefined,
     });
   }
 
@@ -622,14 +634,23 @@ export class ViewerSession {
           if (phase === 'joining') return;
           this.setState({ cameraPresent: true });
           return;
-        case 'room-closed':
-          // Camera pressed Stop (or grace expired). Calm end state — this is
-          // deliberate teardown, NOT an alarm (Task 10 distinguishes DOWN).
+        case 'room-closed': {
+          // Camera pressed Stop, OR grace expired after an unintentional
+          // death (server sends the same message for both — see
+          // ViewerState.endedReason's doc). Distinguish using OUR OWN
+          // current state, captured before this handler changes it:
+          // cameraPresent still true means the camera was live/present as
+          // far as we knew (peer-left never fired) → deliberate stop.
+          // cameraPresent already false means a peer-left already told us
+          // the camera vanished — this room-closed is just the grace-expiry
+          // follow-up to that earlier, real death.
+          const endedReason = this.state.cameraPresent ? 'stopped' : 'lost';
           this.closePeer();
           this.setRemoteStream(null);
           this.releaseMic();
-          this.setState({ phase: 'ended', cameraPresent: false, talk: 'idle' });
+          this.setState({ phase: 'ended', cameraPresent: false, talk: 'idle', endedReason });
           return;
+        }
         case 'error':
           return this.handleErrorReason(msg.reason);
         case 'room-created':

@@ -432,6 +432,38 @@ describe('entry ladder', () => {
     expect(h.last().phase).toBe('live');
   });
 
+  // Review fix: the server also returns error:invalid for a HARD capacity
+  // refusal (MAX_ROOMS — see server/rooms.ts's createRoom/recreateRoom), not
+  // only for stale-signal noise. Arriving while a room-entry attempt is in
+  // flight, it must fail loudly (mirrors the rate-limited case above) rather
+  // than being swallowed and wedging phase 'connecting' forever.
+  test('invalid during the ladder (capacity refusal) → phase error, not a silent wedge', async () => {
+    const h = makeHarness();
+    await h.session.start();
+    h.signaling.receive({ type: 'error', reason: 'invalid' });
+    expect(h.last().phase).toBe('error');
+    expect(h.last().error).toBeTruthy();
+  });
+
+  test('invalid during the ladder tears down fully and Retry works', async () => {
+    const h = makeHarness();
+    await h.session.start();
+    await Bun.sleep(0); // wake acquisition settles
+    h.signaling.receive({ type: 'error', reason: 'invalid' });
+    expect(h.last().phase).toBe('error');
+    // Nothing left hot: camera released, wake lock released.
+    expect(h.tracks.every((t) => t.stopped)).toBe(true);
+    expect(h.session.localStream).toBeNull();
+    expect(h.wake.requests[0]!.sentinel.released).toBe(true);
+
+    // Retry: start() must run again, not bounce off a stale running flag.
+    await h.session.start();
+    expect(h.last().phase).toBe('connecting');
+    expect(h.signaling.ofType('create-room')).toHaveLength(2);
+    h.signaling.receive(ROOM_CREATED);
+    expect(h.last().phase).toBe('live');
+  });
+
   test('reclaim → bad-code → recreate → bad-code → identity cleared, create-room (final rung)', async () => {
     const h = makeHarness({ persisted: { code: 'ABCD2345', token: 'tok-old' } });
     await h.session.start();
@@ -636,14 +668,26 @@ describe('signaling reconnect', () => {
 // -- visibility (rung 3) -----------------------------------------------------
 
 describe('visibilitychange → visible', () => {
-  test('re-acquires wake lock; closes only dead peers', async () => {
+  // Review fix: 'disconnected' is a TRANSIENT, frequently self-healing ICE
+  // state (and the state rung-1 recovery is meant to work through — see
+  // src/lib/peer.ts's onconnectionstatechange, which auto-restartIce()s if
+  // the state instead worsens to 'failed'). Removing a 'disconnected' peer
+  // here calls peer.close() and drops that viewer's subsequent ICE-restart
+  // offer as an unknown sender, stranding it. Only genuinely-dead states
+  // ('failed'/'closed') should be cleaned up; 'disconnected' must be
+  // retained and left to self-heal or escalate to 'failed' on its own.
+  test('re-acquires wake lock; closes failed/closed peers but retains transient disconnected ones', async () => {
     const h = makeHarness();
     await h.session.start();
     h.signaling.receive(ROOM_CREATED);
-    h.signaling.receive({ type: 'peer-joined', peerId: 'v1' });
-    h.signaling.receive({ type: 'peer-joined', peerId: 'v2' });
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v1' }); // → failed
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v2' }); // → connected
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v3' }); // → disconnected (transient)
+    h.signaling.receive({ type: 'peer-joined', peerId: 'v4' }); // → closed
     h.peers[0]!.setConnState('failed');
     h.peers[1]!.setConnState('connected');
+    h.peers[2]!.setConnState('disconnected');
+    h.peers[3]!.setConnState('closed');
     await Bun.sleep(0); // let start()'s wake acquisition settle
     const wakeBefore = h.wake.requests.length;
 
@@ -652,9 +696,11 @@ describe('visibilitychange → visible', () => {
 
     h.fireVisibility('visible');
     expect(h.wake.requests.length).toBe(wakeBefore + 1);
-    expect(h.peers[0]!.closed).toBe(true); // dead → cleaned up
+    expect(h.peers[0]!.closed).toBe(true); // failed → dead, cleaned up
     expect(h.peers[1]!.closed).toBe(false); // healthy → untouched
-    expect(h.last().viewerCount).toBe(1);
+    expect(h.peers[2]!.closed).toBe(false); // disconnected → transient, RETAINED
+    expect(h.peers[3]!.closed).toBe(true); // closed → dead, cleaned up
+    expect(h.last().viewerCount).toBe(2);
   });
 });
 

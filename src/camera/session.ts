@@ -514,11 +514,29 @@ export class CameraSession {
         }
         return;
       }
-      case 'invalid':
+      case 'invalid': {
+        if (this.attempt !== null) {
+          // Mid-entry, 'invalid' is NOT stale-signal noise: the server also
+          // returns error:invalid for a HARD capacity refusal (MAX_ROOMS —
+          // see server/rooms.ts's createRoom/recreateRoom) when a room-entry
+          // request is refused. Swallowing it here would silently wedge
+          // phase 'connecting' forever — wake lock held, camera LED on, no
+          // user-visible error, no retry. Fail loudly instead, exactly like
+          // the neighbouring rate-limited case.
+          this.attempt = null;
+          this.failSession('Server is full — wait a moment and retry.');
+          return;
+        }
+        // No entry attempt in flight: expected noise — stale signals queued
+        // during an outage flush before our reclaim rebinds the socket, and
+        // the relay answers each with error:invalid (see SignalingClient.
+        // send docs).
+        return;
+      }
       case 'room-full':
-        // 'invalid' is expected noise: stale signals queued during an outage
-        // flush before our reclaim rebinds the socket, and the relay answers
-        // each with error:invalid (see SignalingClient.send docs).
+        // Not a reason the relay sends to the camera in practice (room-full
+        // only refuses a viewer's join-room), but the exhaustive switch
+        // still requires a case: no-op.
         return;
       default: {
         const _exhaustive: never = reason;
@@ -556,20 +574,24 @@ export class CameraSession {
    * Reconnection-ladder rung 3 (tab suspended → visible): re-acquire the wake
    * lock, then sweep peers. Division of labor: if a peer's data channel and
    * connection survived suspension there is nothing to do; if its connection
-   * died ('failed'/'closed'/'disconnected') we only CLEAN UP here — the
-   * VIEWER side watchdog (Tasks 8/10) drives its own re-join, which produces
-   * a fresh peer-joined for us and a clean re-offer. The viewer re-join path
-   * is the designed recovery; the camera never guesses at the roster.
+   * died ('failed'/'closed') we only CLEAN UP here — the VIEWER side
+   * watchdog (Tasks 8/10) drives its own re-join, which produces a fresh
+   * peer-joined for us and a clean re-offer. The viewer re-join path is the
+   * designed recovery; the camera never guesses at the roster.
+   *
+   * Review fix: deliberately do NOT remove peers in 'disconnected' — it is a
+   * TRANSIENT, frequently self-healing ICE state, not a dead one. Removing
+   * it here calls peer.close() and then this camera drops that viewer's
+   * subsequent ICE-restart offer as an unknown sender (see handleMessage's
+   * 'signal' case), stranding a viewer that would otherwise have recovered
+   * on its own or via the automatic restartIce() that fires if the state
+   * instead worsens to 'failed' (src/lib/peer.ts's onconnectionstatechange).
    */
   private handleVisible(): void {
     if (!this.running) return;
     void this.acquireWakeLock();
     for (const [id, rec] of [...this.peers]) {
-      if (
-        rec.connState === 'failed' ||
-        rec.connState === 'closed' ||
-        rec.connState === 'disconnected'
-      ) {
+      if (rec.connState === 'failed' || rec.connState === 'closed') {
         this.removePeer(id);
       }
     }

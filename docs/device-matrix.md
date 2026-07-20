@@ -51,6 +51,21 @@ of range and back, for the LAN environment).
   via ICE restart / signaling reconnect once Wi-Fi is restored — again with
   no manual action required on either phone.
 
+### 4. iOS tab-suspend drill (frozen-frame corner, real device only)
+
+While streaming, background Safari (or lock the screen / simulate an
+incoming call) on the **camera phone** WITHOUT dropping Wi-Fi.
+
+- **Expected:** the viewer shows the full-screen DOWN alarm within roughly
+  8 seconds, exactly as in drills 1 and 2.
+- This drill exists as its own explicit checklist item because it isolates
+  the "frozen-frame-looks-live" path (the camera's last frame is still
+  displayable while iOS has actually killed the underlying stream) from the
+  Wi-Fi-drop path drill 3 exercises — headless e2e cannot reproduce real iOS
+  tab suspension at all, so only unit tests (the watchdog's `framesDecoded`
+  stall check) and this manual drill cover it. iOS Safari only; run once per
+  network (LAN, Remote) — 2 runs.
+
 ## Known platform landmines
 
 These are expected behaviors, not bugs — keep them in mind while running the
