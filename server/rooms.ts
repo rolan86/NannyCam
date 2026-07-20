@@ -19,10 +19,12 @@
 // - Hard cap of MAX_VIEWERS viewers, server-enforced.
 //
 // Rate limiting: per connection id, sliding 60-second window over FAILED
-// join and recreate attempts only (bad-code and room-full both count;
-// successes never count). recreateRoom shares the limiter because a failed
-// recreate reveals room existence — unthrottled it would be a room-existence
-// oracle. Once RATE_LIMIT_MAX_FAILURES failures sit inside the window,
+// join, recreate, reclaim, and stop-camera attempts (bad-code, bad-token,
+// and room-full all count; successes never count). recreate/reclaim/
+// stop-camera share the limiter because each one's failure reveals room
+// existence (and, for reclaim/stop-camera, is also a token-guessing attempt)
+// — unthrottled, any of them would be a room-existence oracle. Once
+// RATE_LIMIT_MAX_FAILURES failures sit inside the window,
 // further attempts from that connection get 'rate-limited'. Rate-limited
 // responses themselves are not recorded, so retrying while limited does not
 // extend the window. Limiter state is pruned lazily on each check and

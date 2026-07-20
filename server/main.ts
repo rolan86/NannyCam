@@ -29,8 +29,8 @@ export const SWEEP_INTERVAL_MS = 1000;
 interface SocketData {
   /**
    * Server-generated peer id; doubles as the rate-limiter connection id
-   * (RoomManager's joinRoom/recreateRoom/reclaimRoom all key their sliding
-   * failure window on this string — see rooms.ts). Task 14 decision, worth
+   * (RoomManager's joinRoom/recreateRoom/reclaimRoom/stopCamera all key their
+   * sliding failure window on this string — see rooms.ts). Task 14 decision, worth
    * documenting explicitly: this is per-CONNECTION identity, not per-IP.
    * A reconnecting client gets a fresh peerId and therefore a fresh rate
    * limit window — an attacker who can freely reconnect (nothing here rate
