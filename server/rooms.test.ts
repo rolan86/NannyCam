@@ -297,7 +297,7 @@ describe('spec: only an explicit "Stop camera" action destroys the room immediat
     rm.joinRoom(code, 'v1', 'conn-1');
     rm.joinRoom(code, 'v2', 'conn-2');
 
-    expect(rm.stopCamera(code, cameraToken)).toEqual({ ok: true, viewers: ['v1', 'v2'] });
+    expect(rm.stopCamera(code, cameraToken, 'cam-1')).toEqual({ ok: true, viewers: ['v1', 'v2'] });
     expect(rm.hasRoom(code)).toBe(false);
     expect(rm.joinRoom(code, 'v3', 'conn-3')).toEqual({
       ok: false,
@@ -308,13 +308,13 @@ describe('spec: only an explicit "Stop camera" action destroys the room immediat
   test('stopCamera with no viewers → empty eviction list', () => {
     const { rm } = setup();
     const { code, cameraToken } = makeRoom(rm);
-    expect(rm.stopCamera(code, cameraToken)).toEqual({ ok: true, viewers: [] });
+    expect(rm.stopCamera(code, cameraToken, 'cam-1')).toEqual({ ok: true, viewers: [] });
   });
 
   test('wrong token → bad-token; room survives', () => {
     const { rm } = setup();
     const { code } = makeRoom(rm);
-    expect(rm.stopCamera(code, 'deadbeefdeadbeefdeadbeefdeadbeef')).toEqual({
+    expect(rm.stopCamera(code, 'deadbeefdeadbeefdeadbeefdeadbeef', 'cam-1')).toEqual({
       ok: false,
       reason: 'bad-token',
     });
@@ -323,7 +323,7 @@ describe('spec: only an explicit "Stop camera" action destroys the room immediat
 
   test('unknown code → bad-code', () => {
     const { rm } = setup();
-    expect(rm.stopCamera('ZZZZZZZZ', 'deadbeefdeadbeefdeadbeefdeadbeef')).toEqual({
+    expect(rm.stopCamera('ZZZZZZZZ', 'deadbeefdeadbeefdeadbeefdeadbeef', 'cam-1')).toEqual({
       ok: false,
       reason: 'bad-code',
     });
@@ -613,6 +613,63 @@ describe('rate limiting: failed joins per connection id (sliding 60 s window)', 
       reason: 'rate-limited',
     });
   });
+
+  // -- Task 14 (review fix): stopCamera joins the shared rate limiter -------
+  // stopCamera has the identical two-outcome (bad-code / bad-token) oracle
+  // shape as reclaimRoom, so it must share the same per-connection limiter.
+
+  test('more than 10 failed stopCamera attempts (bad-code) within 60 s → rate-limited', () => {
+    const { rm } = setup();
+    for (let i = 0; i < RATE_LIMIT_MAX_FAILURES; i++) {
+      expect(rm.stopCamera('ZZZZZZZZ', 'deadbeefdeadbeefdeadbeefdeadbeef', 'cam-1')).toEqual({
+        ok: false,
+        reason: 'bad-code',
+      });
+    }
+    expect(rm.stopCamera('ZZZZZZZZ', 'deadbeefdeadbeefdeadbeefdeadbeef', 'cam-1')).toEqual({
+      ok: false,
+      reason: 'rate-limited',
+    });
+  });
+
+  test('more than 10 failed stopCamera attempts (bad-token, room exists) within 60 s → rate-limited', () => {
+    const { rm } = setup();
+    const { code, cameraToken } = makeRoom(rm);
+    for (let i = 0; i < RATE_LIMIT_MAX_FAILURES; i++) {
+      expect(rm.stopCamera(code, 'deadbeefdeadbeefdeadbeefdeadbeef', 'cam-1')).toEqual({
+        ok: false,
+        reason: 'bad-token',
+      });
+    }
+    expect(rm.stopCamera(code, 'deadbeefdeadbeefdeadbeefdeadbeef', 'cam-1')).toEqual({
+      ok: false,
+      reason: 'rate-limited',
+    });
+    // Even the RIGHT token is refused while limited.
+    expect(rm.stopCamera(code, cameraToken, 'cam-1')).toEqual({
+      ok: false,
+      reason: 'rate-limited',
+    });
+    expect(rm.hasRoom(code)).toBe(true);
+  });
+
+  test('a successful stopCamera does not count toward the limit', () => {
+    const { rm } = setup();
+    for (let i = 0; i < RATE_LIMIT_MAX_FAILURES; i++) {
+      const { code, cameraToken } = makeRoom(rm);
+      expect(rm.stopCamera(code, cameraToken, 'cam-1')).toEqual({ ok: true, viewers: [] });
+    }
+    expect(rm.trackedConnections()).toBe(0);
+  });
+
+  test('stopCamera rate limit is per connection id: other connections are unaffected', () => {
+    const { rm } = setup();
+    const { code, cameraToken } = makeRoom(rm);
+    for (let i = 0; i < RATE_LIMIT_MAX_FAILURES + 1; i++) {
+      rm.stopCamera('ZZZZZZZZ', 'deadbeefdeadbeefdeadbeefdeadbeef', 'cam-1');
+    }
+    expect(rm.stopCamera(code, cameraToken, 'cam-2')).toEqual({ ok: true, viewers: [] });
+  });
 });
 
 // -- Task 14: global MAX_ROOMS cap -------------------------------------------
@@ -633,7 +690,7 @@ describe('MAX_ROOMS: global cap on live-or-orphaned rooms', () => {
     const rooms = Array.from({ length: MAX_ROOMS }, () => makeRoom(rm));
     expect(rm.createRoom()).toEqual({ ok: false, reason: 'invalid' });
     const first = rooms[0]!;
-    rm.stopCamera(first.code, first.cameraToken);
+    rm.stopCamera(first.code, first.cameraToken, 'cam-1');
     const res = rm.createRoom();
     expect(res.ok).toBe(true);
   });

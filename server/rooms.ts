@@ -200,11 +200,26 @@ export class RoomManager {
    * Explicit "Stop camera": immediate destroy of the room and its code.
    * The ok payload carries the evicted viewer ids so the server can
    * broadcast room-closed to them.
+   *
+   * Review fix (post-Task 14): shares the same per-connection rate limiter
+   * as join/recreate/reclaim. stopCamera has the identical two-outcome
+   * shape as reclaimRoom (bad-code vs bad-token) — an unbound socket calling
+   * stop-camera with guessed codes could otherwise enumerate which room
+   * codes are live by reading the error reason, exactly the room-existence
+   * + token-guessing oracle reclaimRoom's doc warns about. Failed attempts
+   * (bad-code AND bad-token) are recorded; the rate limiter, not collapsing
+   * the two reasons into one, is what closes the oracle. Successes are
+   * never recorded, same convention as the other three methods.
    */
-  stopCamera(code: string, cameraToken: string): Result<{ viewers: string[] }> {
+  stopCamera(code: string, cameraToken: string, connectionId: string): Result<{ viewers: string[] }> {
+    if (this.isRateLimited(connectionId)) {
+      return { ok: false, reason: 'rate-limited' };
+    }
     const room = this.rooms.get(code);
-    if (!room) return { ok: false, reason: 'bad-code' };
-    if (!this.tokenMatches(room, cameraToken)) return { ok: false, reason: 'bad-token' };
+    if (!room) return this.recordFailure(connectionId, 'bad-code');
+    if (!this.tokenMatches(room, cameraToken)) {
+      return this.recordFailure(connectionId, 'bad-token');
+    }
     this.rooms.delete(code);
     return { ok: true, viewers: [...room.viewers.keys()] };
   }

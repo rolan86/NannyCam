@@ -61,6 +61,12 @@ export interface StartOptions {
   now?: () => number;
   /** Built client assets directory; defaults to <repo>/dist. */
   distDir?: string;
+  /**
+   * Adds `ws:` to the CSP `connect-src` so the e2e suite can run the relay
+   * over plain http://localhost. MUST stay false in production — behind
+   * `tailscale serve` the app is always https/wss. Defaults to false.
+   */
+  allowInsecureWs?: boolean;
 }
 
 export interface RelayHandle {
@@ -76,32 +82,44 @@ export interface RelayHandle {
 const err = (reason: ErrorReason): S2C => ({ type: 'error', reason });
 
 /**
- * Task 14: every HTTP response carries this CSP — the mechanical enforcement
- * of the spec's "no external requests" rule. `connect-src` allows both
- * `wss:` (production: tailscale serve terminates TLS in front of this
- * process, so the app always sees itself as https:// and dials wss://) and
- * `ws:` (the e2e suite boots the bare Bun server on plain http://localhost,
- * so SignalingClient's `location.protocol === 'https:' ? 'wss' : 'ws'`
- * dials ws:// there — without this the whole e2e suite would fail closed
- * under its own CSP). `img-src 'self' data:` covers qrcode's `toCanvas`,
- * which draws directly to a <canvas> (no data: URI actually crosses the
- * wire) — kept anyway as harmless slack matching the spec string exactly.
- * `media-src 'self' blob:` covers the <video>/<audio> elements' MediaStream
- * srcObject assignments (WebRTC-internal, not a network fetch, but some
- * engines still gate srcObject through media-src). No `script-src` override:
- * default-src 'self' already blocks inline/external scripts, and Vite emits
- * only external, hashed, same-origin module scripts — no nonce needed.
+ * Task 14 (review fix: environment-conditional CSP): every HTTP response
+ * carries this CSP — the mechanical enforcement of the spec's "no external
+ * requests" rule. `connect-src` is `wss:`-only by default, exactly matching
+ * the implementation plan's canonical string: production always sits behind
+ * `tailscale serve`, which terminates TLS in front of this process, so the
+ * app always sees itself as https:// and SignalingClient's
+ * `location.protocol === 'https:' ? 'wss' : 'ws'` dials wss:// only. Shipping
+ * `ws:` to production would be an unnecessary loosening of the policy for a
+ * transport the app never actually uses there.
+ *
+ * `opts.allowInsecureWs` (see StartOptions) is the ONLY way to add `ws:` to
+ * `connect-src`, and it must stay false in production. It exists purely for
+ * the e2e suite, which boots the bare Bun server on plain http://localhost —
+ * there `location.protocol` is `http:`, so SignalingClient dials `ws://`,
+ * and without this opt-in the whole e2e suite would fail closed under its
+ * own CSP.
+ *
+ * `img-src 'self' data:` covers qrcode's `toCanvas`, which draws directly to
+ * a <canvas> (no data: URI actually crosses the wire) — kept anyway as
+ * harmless slack matching the spec string exactly. `media-src 'self' blob:`
+ * covers the <video>/<audio> elements' MediaStream srcObject assignments
+ * (WebRTC-internal, not a network fetch, but some engines still gate
+ * srcObject through media-src). No `script-src` override: default-src 'self'
+ * already blocks inline/external scripts, and Vite emits only external,
+ * hashed, same-origin module scripts — no nonce needed.
  */
-const CSP =
-  "default-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self' wss: ws:";
-
-function withCsp(res: Response): Response {
-  res.headers.set('Content-Security-Policy', CSP);
-  return res;
+function buildCsp(allowInsecureWs: boolean): string {
+  const connectSrc = allowInsecureWs ? "'self' wss: ws:" : "'self' wss:";
+  return `default-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src ${connectSrc}`;
 }
 
 export function startServer(opts: StartOptions): RelayHandle {
   const distDir = normalize(opts.distDir ?? join(import.meta.dir, '..', 'dist'));
+  const csp = buildCsp(opts.allowInsecureWs ?? false);
+  function withCsp(res: Response): Response {
+    res.headers.set('Content-Security-Policy', csp);
+    return res;
+  }
   const rooms = new RoomManager(opts.now ?? Date.now);
   /** peerId -> live socket. */
   const peers = new Map<string, Socket>();
@@ -247,14 +265,17 @@ export function startServer(opts: StartOptions): RelayHandle {
         // The token is the real authentication; the role checks are
         // defense-in-depth (a viewer could always open a second, unbound
         // socket). Unbound senders with a valid token are deliberately
-        // accepted — a reconnected camera may stop without reclaiming first.
-        // Task 14: re-verified against stopCamera's own token check
-        // (rooms.ts, now constant-time) — still accurate, no change needed.
+        // accepted — a reconnected camera may stop without reclaiming first,
+        // which is exactly why this path is reachable unauthenticated and
+        // needs its own rate limiting: peerId doubles as the connection id
+        // (SocketData's doc), routed through the same per-connection limiter
+        // reclaimRoom uses (rooms.ts stopCamera's doc) since stopCamera has
+        // the identical bad-code/bad-token oracle shape.
         if (ws.data.role === 'viewer') return send(ws, err('invalid'));
         if (ws.data.role === 'camera' && ws.data.roomCode !== msg.code) {
           return send(ws, err('invalid'));
         }
-        const res = rooms.stopCamera(msg.code, msg.cameraToken);
+        const res = rooms.stopCamera(msg.code, msg.cameraToken, ws.data.peerId);
         if (!res.ok) return send(ws, err(res.reason));
         // Evicted viewers learn the room is gone; their sockets stay open
         // with bindings cleared so they may join another room.
@@ -409,6 +430,9 @@ export function startServer(opts: StartOptions): RelayHandle {
 }
 
 if (import.meta.main) {
-  const { port } = startServer({ port: Number(Bun.env.PORT ?? 8080) });
+  const { port } = startServer({
+    port: Number(Bun.env.PORT ?? 8080),
+    allowInsecureWs: Bun.env.NANNYCAM_ALLOW_INSECURE_WS === '1',
+  });
   console.log(`Listening on http://localhost:${port}`);
 }

@@ -37,7 +37,12 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: `bun run build && PORT=${PORT} bun run serve`,
+    // NANNYCAM_ALLOW_INSECURE_WS=1: this suite runs the relay on plain
+    // http://localhost, so SignalingClient dials ws:// (not wss://) — the
+    // server's CSP is wss-only by default (prod is always https behind
+    // tailscale serve), so the opt-in is required for the relay's own CSP
+    // not to block it.
+    command: `bun run build && PORT=${PORT} NANNYCAM_ALLOW_INSECURE_WS=1 bun run serve`,
     url: `${baseURL}/healthz`,
     reuseExistingServer: false,
     timeout: 60_000,

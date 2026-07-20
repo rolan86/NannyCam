@@ -43,7 +43,9 @@ afterEach(() => {
   tempDirs.length = 0;
 });
 
-function boot(opts: { now?: () => number; distDir?: string } = {}): RelayHandle {
+function boot(
+  opts: { now?: () => number; distDir?: string; allowInsecureWs?: boolean } = {},
+): RelayHandle {
   const h = startServer({ port: 0, ...opts });
   handles.push(h);
   return h;
@@ -695,17 +697,22 @@ describe('static file serving', () => {
 // -- CSP -----------------------------------------------------------------
 
 describe('Content-Security-Policy', () => {
-  const csp =
+  // Production default: wss-only, matching the implementation plan's
+  // canonical string exactly. `ws:` is an explicit opt-in (allowInsecureWs)
+  // for the e2e suite, which boots the bare server on plain http://localhost.
+  const cspDefault =
+    "default-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self' wss:";
+  const cspInsecureWs =
     "default-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self' wss: ws:";
 
-  function bootWithDist(): RelayHandle {
+  function bootWithDist(opts: { allowInsecureWs?: boolean } = {}): RelayHandle {
     const dir = mkdtempSync(join(tmpdir(), 'nannycam-dist-csp-'));
     tempDirs.push(dir);
     writeFileSync(join(dir, 'index.html'), '<h1>nannycam home</h1>');
-    return boot({ distDir: dir });
+    return boot({ distDir: dir, ...opts });
   }
 
-  test('every HTTP response carries the CSP header, including 200s, 404s, and the /ws 400', async () => {
+  test('every HTTP response carries the default (wss-only) CSP header, including 200s, 404s, and the /ws 400', async () => {
     const h = bootWithDist();
     const cases = [
       `http://127.0.0.1:${h.port}/`,
@@ -715,7 +722,26 @@ describe('Content-Security-Policy', () => {
     ];
     for (const url of cases) {
       const res = await fetch(url);
-      expect(res.headers.get('Content-Security-Policy')).toBe(csp);
+      expect(res.headers.get('Content-Security-Policy')).toBe(cspDefault);
     }
+  });
+
+  test('default CSP connect-src does not include the ws: token (production must be wss-only)', async () => {
+    const h = bootWithDist();
+    const res = await fetch(`http://127.0.0.1:${h.port}/healthz`);
+    const header = res.headers.get('Content-Security-Policy') ?? '';
+    const connectSrc = header.split(';').find((d) => d.trim().startsWith('connect-src'));
+    expect(connectSrc).toBeDefined();
+    const tokens = connectSrc!.trim().split(/\s+/);
+    // Exact-token check: `wss:` contains the substring `ws`, so a substring
+    // match would false-pass. Assert the standalone ` ws:` token is absent.
+    expect(tokens).not.toContain('ws:');
+    expect(tokens).toContain('wss:');
+  });
+
+  test('allowInsecureWs: true adds the ws: token to connect-src (dev/e2e only)', async () => {
+    const h = bootWithDist({ allowInsecureWs: true });
+    const res = await fetch(`http://127.0.0.1:${h.port}/healthz`);
+    expect(res.headers.get('Content-Security-Policy')).toBe(cspInsecureWs);
   });
 });
