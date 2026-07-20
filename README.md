@@ -41,10 +41,14 @@ Two cheap ways to check this yourself instead of trusting this paragraph:
    signaling. (It is not a per-host allowlist; the "no third party" guarantee
    above comes from the `iceServers: []` config and self-hosting, not from
    the CSP.)
-3. **Read the code.** This is a small, dependency-light codebase — two
-   runtime dependencies total (`qrcode`, for rendering the pairing QR code).
-   Everything else — signaling, room lifecycle, the watchdog, the
-   noise/motion detectors — is first-party code in this repo.
+3. **Read the code.** This is a small, dependency-light codebase. The server
+   process imports no third-party packages at all — only Bun/Node built-ins
+   and first-party code in this repo. The client bundle ships exactly two
+   third-party libraries: [Preact](https://preactjs.com) (the ~4 KB view
+   layer) and `qrcode` (for rendering the pairing QR code). Everything else —
+   signaling, room lifecycle, the watchdog, the noise/motion detectors — is
+   first-party. You can confirm the server's dependency set by reading
+   `package.json`: `dependencies` lists only `qrcode`.
 4. **Run the tests yourself** — see below.
 
 ## Quickstart
