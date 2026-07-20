@@ -193,6 +193,12 @@ export function Preflight({ storage, onGoLive, onCancel, wakeLock, getBattery }:
     // Audio call with no branching logic worth pinning.
     try {
       const ctx = new AudioContext();
+      // iOS Safari (and some other browsers) can construct a context already
+      // in 'suspended' state even from a genuine user gesture; resume() is
+      // itself gesture-safe to call here (we're still inside the click
+      // handler) and a no-op if the context is already running. Failure is
+      // non-fatal — same as everything else in this informational test tone.
+      void ctx.resume().catch(() => {});
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = 'sine';
@@ -301,15 +307,27 @@ export function Preflight({ storage, onGoLive, onCancel, wakeLock, getBattery }:
         <button type="button" class="preflight-cancel" onClick={onCancel}>
           Back
         </button>
-        <button
-          type="button"
-          class="primary"
-          data-testid="preflight-golive"
-          disabled={!ready}
-          onClick={onGoLive}
-        >
-          Go live
-        </button>
+        <div class="preflight-golive-wrap">
+          <button
+            type="button"
+            class="primary"
+            data-testid="preflight-golive"
+            disabled={!ready}
+            aria-describedby={ready ? undefined : 'preflight-golive-hint'}
+            onClick={onGoLive}
+          >
+            Go live
+          </button>
+          {!ready && (
+            <p
+              class="preflight-golive-hint"
+              id="preflight-golive-hint"
+              data-testid="preflight-golive-hint"
+            >
+              Check both boxes above to enable Go live.
+            </p>
+          )}
+        </div>
       </div>
     </main>
   );

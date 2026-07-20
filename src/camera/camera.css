@@ -14,6 +14,10 @@ main.center { justify-content: center; }
 button { font-size: 1.25rem; padding: 0.9rem 2.2rem; border: none; border-radius: 8px; cursor: pointer; }
 button.primary { background: #2b7; color: #fff; }
 button.danger { background: #d33; color: #fff; }
+/* Task 14 opening move (a): the dedicated idle screen's secondary entry back
+   into the pre-flight checklist — deliberately understated next to the
+   primary "Start camera" button. */
+button.setup-link { background: none; color: #888; font-size: 0.9rem; padding: 0.4rem 0.5rem; text-decoration: underline; }
 
 /* Task 11 — collapsible Alerts panel: noise/motion toggles + sensitivity sliders. */
 .alerts-panel { width: 100%; max-width: 480px; background: #1b1b1b; border-radius: 8px; padding: 0.25rem 0.75rem; }
@@ -49,3 +53,5 @@ button.danger { background: #d33; color: #fff; }
 .preflight-actions { display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin-top: 0.5rem; }
 .preflight-cancel { background: none; color: #999; font-size: 1rem; padding: 0.6rem 0.5rem; }
 .preflight-actions .primary:disabled { background: #245; color: #789; cursor: not-allowed; }
+.preflight-golive-wrap { display: flex; flex-direction: column; align-items: flex-end; gap: 0.35rem; }
+.preflight-golive-hint { color: #e8a33d; font-size: 0.8rem; text-align: right; max-width: 14rem; }

@@ -226,16 +226,11 @@ function App() {
       // toggling "dedicated device" mid-checklist and backing out
       // immediately reflects on the idle screen without a reload.
       const dedicated = loadDedicated(localStorage);
-      if (dedicated) {
-        return (
-          <main class="center">
-            <h1>NannyCam</h1>
-            <button class="primary" onClick={() => void session.start()}>
-              Start camera
-            </button>
-          </main>
-        );
-      }
+      // Checked BEFORE the dedicated branch below: a dedicated device must
+      // still be able to reach the checklist (opening move (a), Task 13
+      // review fold-in) — Preflight itself already renders the dedicated
+      // checkbox pre-checked (loadDedicated on mount) plus a "Back" button,
+      // so this is the one-way door's escape hatch, not a new screen.
       if (preflightOpen) {
         return (
           <Preflight
@@ -246,6 +241,24 @@ function App() {
             }}
             onCancel={() => setPreflightOpen(false)}
           />
+        );
+      }
+      if (dedicated) {
+        return (
+          <main class="center">
+            <h1>NannyCam</h1>
+            <button class="primary" onClick={() => void session.start()}>
+              Start camera
+            </button>
+            <button
+              type="button"
+              class="setup-link"
+              data-testid="dedicated-setup-link"
+              onClick={() => setPreflightOpen(true)}
+            >
+              Set up…
+            </button>
+          </main>
         );
       }
       return (

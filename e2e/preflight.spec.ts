@@ -71,3 +71,49 @@ test('non-dedicated device: checklist walkthrough — checking both boxes enable
     await ctx.close();
   }
 });
+
+// Task 14 opening move (a): the dedicated-device flag is a one-way door out
+// of the checklist on ordinary reloads, but must never be a one-way door out
+// of REACHING the checklist — the secondary "Set up…" link on the dedicated
+// idle screen is that escape hatch.
+test('dedicated device: "Set up…" link reopens the checklist; unchecking it restores the checklist on reload', async ({
+  browser,
+}) => {
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+
+  try {
+    await page.goto('/camera.html');
+
+    // Check the box via the ordinary (non-dedicated) checklist walkthrough.
+    await page.getByRole('button', { name: 'Set up camera' }).click();
+    await expect(page.getByTestId('preflight-screen')).toBeVisible();
+    await page.getByTestId('preflight-dedicated').check();
+    await page.locator('.preflight-cancel').click(); // Back — dedicated flag persists regardless
+
+    // Reload: dedicated device skips the checklist.
+    await page.reload();
+    await expect(page.getByTestId('preflight-screen')).toHaveCount(0);
+    const startBtn = page.getByRole('button', { name: 'Start camera' });
+    await expect(startBtn).toBeVisible();
+
+    // Re-enter via the secondary link, with the dedicated box pre-checked.
+    const setupLink = page.getByTestId('dedicated-setup-link');
+    await expect(setupLink).toBeVisible();
+    await setupLink.click();
+    const screen = page.getByTestId('preflight-screen');
+    await expect(screen).toBeVisible();
+    await expect(page.getByTestId('preflight-dedicated')).toBeChecked();
+
+    // Uncheck it and back out.
+    await page.getByTestId('preflight-dedicated').uncheck();
+    await page.locator('.preflight-cancel').click();
+
+    // Reload: the checklist is no longer skipped.
+    await page.reload();
+    await expect(page.getByRole('button', { name: 'Set up camera' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Start camera' })).toHaveCount(0);
+  } finally {
+    await ctx.close();
+  }
+});
