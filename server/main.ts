@@ -431,7 +431,7 @@ export function startServer(opts: StartOptions): RelayHandle {
 
 if (import.meta.main) {
   const { port } = startServer({
-    port: Number(Bun.env.PORT ?? 8080),
+    port: Number(Bun.env.PORT ?? 8060),
     allowInsecureWs: Bun.env.NANNYCAM_ALLOW_INSECURE_WS === '1',
   });
   console.log(`Listening on http://localhost:${port}`);
